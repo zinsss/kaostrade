@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime data
+data/
+logs/
+models/
+backups/
+reports/
+
+# Secrets
+.env
+*.key
+*.pem
+
+# OS/editor
+.DS_Store
+.vscode/
