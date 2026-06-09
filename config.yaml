@@ -10,6 +10,11 @@ database:
   path: /app/data/kaostrade.sqlite
 
 collector:
+  interval_sec: 30
+  candle_intervals:
+    - 1m
+    - 5m
+    - 15m
   static_whitelist:
     - KRW-BTC
     - KRW-ETH

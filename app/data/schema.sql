@@ -47,3 +47,24 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_orderbook_snapshots_market_collected_at
 ON orderbook_snapshots (market, collected_at);
+
+CREATE TABLE IF NOT EXISTS candles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    candle_date_time_utc TEXT NOT NULL,
+    candle_date_time_kst TEXT,
+    opening_price REAL,
+    high_price REAL,
+    low_price REAL,
+    trade_price REAL,
+    candle_acc_trade_price REAL,
+    candle_acc_trade_volume REAL,
+    timestamp INTEGER,
+    raw_json TEXT NOT NULL,
+    UNIQUE (market, interval, candle_date_time_utc),
+    FOREIGN KEY (market) REFERENCES markets (market)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candles_market_interval_time
+ON candles (market, interval, candle_date_time_utc);
