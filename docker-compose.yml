@@ -3,6 +3,8 @@ services:
     build: .
     container_name: kaostrade
     user: "1000:1000"
+    environment:
+      - TZ=Asia/Seoul
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

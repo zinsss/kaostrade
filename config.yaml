@@ -14,3 +14,5 @@ collector:
     - KRW-BTC
     - KRW-ETH
     - KRW-XRP
+    - KRW-SOL
+    - KRW-DOGE
