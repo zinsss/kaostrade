@@ -12,3 +12,17 @@ services:
       - ./models:/app/models
       - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped
+
+  kaostrade-tui:
+    build: .
+    container_name: kaostrade-tui
+    user: "1000:1000"
+    environment:
+      - TZ=Asia/Seoul
+    command: python -m app.tui.dashboard
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./config.yaml:/app/config.yaml:ro
+    restart: "no"
