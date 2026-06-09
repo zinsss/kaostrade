@@ -14,6 +14,7 @@ from rich.table import Table
 CONFIG_PATH = Path("/app/config.yaml")
 DEFAULT_DB_PATH = "/app/data/kaostrade.sqlite"
 REFRESH_SECONDS = 2
+SPARKLINE_BARS = "▁▂▃▄▅▆▇█"
 
 
 def main() -> None:
@@ -33,6 +34,7 @@ def render_dashboard(db_path: str) -> Group:
     try:
         with connect(db_path) as conn:
             ticker_rows = latest_tickers(conn)
+            sparkline_by_market = latest_sparklines(conn)
             orderbook_rows = latest_orderbooks(conn)
             candle_rows = candle_counts(conn)
     except sqlite3.Error as exc:
@@ -40,7 +42,7 @@ def render_dashboard(db_path: str) -> Group:
 
     return Group(
         header(db_path),
-        ticker_table(ticker_rows),
+        ticker_table(ticker_rows, sparkline_by_market),
         orderbook_table(orderbook_rows),
         candle_table(candle_rows),
     )
@@ -69,6 +71,46 @@ def latest_tickers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         ORDER BY t.market
         """
     ).fetchall()
+
+
+def latest_sparklines(conn: sqlite3.Connection) -> dict[str, str]:
+    rows = conn.execute(
+        """
+        SELECT market, trade_price
+        FROM (
+            SELECT
+                market,
+                trade_price,
+                candle_date_time_utc,
+                ROW_NUMBER() OVER (PARTITION BY market ORDER BY candle_date_time_utc DESC) AS row_num
+            FROM candles
+            WHERE interval = ? AND trade_price IS NOT NULL
+        ) latest
+        WHERE row_num <= 30
+        ORDER BY market, candle_date_time_utc ASC
+        """,
+        ("1m",),
+    ).fetchall()
+
+    prices_by_market: dict[str, list[float]] = {}
+    for row in rows:
+        prices_by_market.setdefault(row["market"], []).append(float(row["trade_price"]))
+
+    return {market: make_sparkline(values) for market, values in prices_by_market.items()}
+
+
+def make_sparkline(values: list[float]) -> str:
+    if not values:
+        return "-"
+
+    low = min(values)
+    high = max(values)
+    if low == high:
+        return SPARKLINE_BARS[len(SPARKLINE_BARS) // 2] * len(values)
+
+    span = high - low
+    max_index = len(SPARKLINE_BARS) - 1
+    return "".join(SPARKLINE_BARS[round((value - low) / span * max_index)] for value in values)
 
 
 def latest_orderbooks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -105,9 +147,10 @@ def candle_counts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def ticker_table(rows: list[sqlite3.Row]) -> Table:
+def ticker_table(rows: list[sqlite3.Row], sparkline_by_market: dict[str, str]) -> Table:
     table = Table(title="Latest Ticker Snapshots")
     table.add_column("Market")
+    table.add_column("Sparkline")
     table.add_column("Collected")
     table.add_column("Trade Price", justify="right")
     table.add_column("Change")
@@ -117,6 +160,7 @@ def ticker_table(rows: list[sqlite3.Row]) -> Table:
     for row in rows:
         table.add_row(
             row["market"],
+            sparkline_by_market.get(row["market"], "-"),
             row["collected_at"],
             format_number(row["trade_price"]),
             str(row["change"] or ""),
@@ -124,7 +168,7 @@ def ticker_table(rows: list[sqlite3.Row]) -> Table:
             format_number(row["acc_trade_price_24h"]),
         )
     if not rows:
-        table.add_row("-", "-", "-", "-", "-", "-")
+        table.add_row("-", "-", "-", "-", "-", "-", "-")
     return table
 
 
