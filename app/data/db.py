@@ -264,6 +264,32 @@ def insert_market_features(conn: sqlite3.Connection, features: dict[str, Any]) -
     return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
 
+def insert_market_regime(conn: sqlite3.Connection, regime: dict[str, Any]) -> int:
+    conn.execute(
+        """
+        INSERT INTO market_regimes (
+            ts, regime, reason, market_features_id, btc_return_1h, eth_return_1h,
+            median_return_1h, positive_ratio, average_spread_pct, average_imbalance_5, market_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            regime["ts"],
+            regime["regime"],
+            regime["reason"],
+            _as_int(regime.get("market_features_id")),
+            _as_float(regime.get("btc_return_1h")),
+            _as_float(regime.get("eth_return_1h")),
+            _as_float(regime.get("median_return_1h")),
+            _as_float(regime.get("positive_ratio")),
+            _as_float(regime.get("average_spread_pct")),
+            _as_float(regime.get("average_imbalance_5")),
+            _as_int(regime.get("market_count")),
+        ),
+    )
+    return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
 def _as_float(value: Any) -> float | None:
     if value is None:
         return None

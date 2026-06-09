@@ -89,3 +89,22 @@ CREATE TABLE IF NOT EXISTS market_features (
 
 CREATE INDEX IF NOT EXISTS idx_market_features_ts
 ON market_features (ts);
+
+CREATE TABLE IF NOT EXISTS market_regimes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    regime TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    market_features_id INTEGER,
+    btc_return_1h REAL,
+    eth_return_1h REAL,
+    median_return_1h REAL,
+    positive_ratio REAL,
+    average_spread_pct REAL,
+    average_imbalance_5 REAL,
+    market_count INTEGER,
+    FOREIGN KEY (market_features_id) REFERENCES market_features (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_regimes_ts
+ON market_regimes (ts);
