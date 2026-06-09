@@ -74,3 +74,18 @@ CREATE TABLE IF NOT EXISTS candles (
 
 CREATE INDEX IF NOT EXISTS idx_candles_market_interval_time
 ON candles (market, interval, candle_date_time_utc);
+
+CREATE TABLE IF NOT EXISTS market_features (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    btc_return_1h REAL,
+    eth_return_1h REAL,
+    median_return_1h REAL,
+    positive_ratio REAL,
+    average_spread_pct REAL,
+    average_imbalance_5 REAL,
+    market_count INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_features_ts
+ON market_features (ts);
