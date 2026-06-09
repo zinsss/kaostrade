@@ -290,6 +290,44 @@ def insert_market_regime(conn: sqlite3.Connection, regime: dict[str, Any]) -> in
     return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
 
+def ensure_paper_account(
+    conn: sqlite3.Connection,
+    name: str,
+    cash_krw: float,
+    now: str,
+) -> dict[str, Any]:
+    existing = conn.execute(
+        """
+        SELECT id, name, cash_krw, created_at, updated_at
+        FROM paper_accounts
+        WHERE name = ?
+        """,
+        (name,),
+    ).fetchone()
+    if existing is not None:
+        return dict(existing)
+
+    conn.execute(
+        """
+        INSERT INTO paper_accounts (name, cash_krw, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (name, _as_float(cash_krw), now, now),
+    )
+    account_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    created = conn.execute(
+        """
+        SELECT id, name, cash_krw, created_at, updated_at
+        FROM paper_accounts
+        WHERE id = ?
+        """,
+        (account_id,),
+    ).fetchone()
+    if created is None:
+        raise RuntimeError("Failed to create paper account")
+    return dict(created)
+
+
 def _as_float(value: Any) -> float | None:
     if value is None:
         return None

@@ -108,3 +108,43 @@ CREATE TABLE IF NOT EXISTS market_regimes (
 
 CREATE INDEX IF NOT EXISTS idx_market_regimes_ts
 ON market_regimes (ts);
+
+CREATE TABLE IF NOT EXISTS paper_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    cash_krw REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    market TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    average_entry_price REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (account_id, market),
+    FOREIGN KEY (account_id) REFERENCES paper_accounts (id)
+);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    market TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price REAL NOT NULL,
+    quantity REAL NOT NULL,
+    notional_krw REAL NOT NULL,
+    fee_krw REAL NOT NULL,
+    reason TEXT,
+    FOREIGN KEY (account_id) REFERENCES paper_accounts (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_positions_account_market
+ON paper_positions (account_id, market);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_account_ts
+ON paper_trades (account_id, ts);
+
