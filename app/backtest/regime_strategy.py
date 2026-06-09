@@ -43,14 +43,21 @@ def connect_read_only(db_path: str) -> sqlite3.Connection:
 def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
-    trade_count = 0
+    buy_count = 0
+    sell_count = 0
+    realized_pnl_krw = 0.0
+    total_fees_krw = 0.0
+    trades: list[dict[str, Any]] = []
     equity_curve: list[dict[str, Any]] = []
     skipped: list[str] = []
+    regime_counts = {"RISK_ON": 0, "NEUTRAL": 0, "RISK_OFF": 0}
 
     regimes = load_regimes(conn)
     for regime_row in regimes:
         ts = str(regime_row["ts"])
         regime = str(regime_row["regime"])
+        if regime in regime_counts:
+            regime_counts[regime] += 1
         price_result = prices_near_timestamp(conn, ts, MARKETS)
         prices = price_result["prices"]
         skipped.extend(f"{ts}: {reason}" for reason in price_result["skipped"])
@@ -70,9 +77,22 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
                     skipped.append(f"{ts}: insufficient cash to buy {market}")
                     continue
                 quantity = TRADE_NOTIONAL_KRW / price
+                fee_krw = TRADE_NOTIONAL_KRW * FEE_RATE
                 cash -= total_cost
                 positions[market] = Position(quantity=quantity, average_entry_price=price)
-                trade_count += 1
+                total_fees_krw += fee_krw
+                buy_count += 1
+                trades.append(
+                    simulated_trade(
+                        ts=ts,
+                        side="BUY",
+                        market=market,
+                        price=price,
+                        quantity=quantity,
+                        notional_krw=TRADE_NOTIONAL_KRW,
+                        fee_krw=fee_krw,
+                    )
+                )
         elif regime == "RISK_OFF":
             for market in list(positions):
                 price = prices.get(market)
@@ -80,8 +100,22 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
                     continue
                 position = positions.pop(market)
                 notional = position.quantity * price
-                cash += notional * (1 - FEE_RATE)
-                trade_count += 1
+                fee_krw = notional * FEE_RATE
+                cash += notional - fee_krw
+                realized_pnl_krw += notional - fee_krw - (position.quantity * position.average_entry_price)
+                total_fees_krw += fee_krw
+                sell_count += 1
+                trades.append(
+                    simulated_trade(
+                        ts=ts,
+                        side="SELL",
+                        market=market,
+                        price=price,
+                        quantity=position.quantity,
+                        notional_krw=notional,
+                        fee_krw=fee_krw,
+                    )
+                )
         elif regime == "NEUTRAL":
             pass
         else:
@@ -98,6 +132,9 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
 
     latest_prices = latest_prices_for_positions(conn, positions)
     final_equity = estimate_equity(cash, positions, latest_prices)
+    unrealized_pnl_krw = unrealized_pnl(positions, latest_prices)
+    first_ts = str(regimes[0]["ts"]) if regimes else None
+    last_ts = str(regimes[-1]["ts"]) if regimes else None
     latest_equity_point = equity_curve[-1] if equity_curve else None
     if latest_equity_point is not None:
         latest_equity_point = dict(latest_equity_point)
@@ -108,12 +145,66 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
         "start_cash": START_CASH_KRW,
         "final_equity": final_equity,
         "return_pct": (final_equity - START_CASH_KRW) / START_CASH_KRW * 100,
-        "trade_count": trade_count,
+        "realized_pnl_krw": realized_pnl_krw,
+        "unrealized_pnl_krw": unrealized_pnl_krw,
+        "total_fees_krw": total_fees_krw,
+        "trade_count": buy_count + sell_count,
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "duration_hours": duration_hours(first_ts, last_ts),
+        "regime_counts": regime_counts,
         "max_drawdown_pct": max_drawdown_pct(equity_curve),
         "positions": serialize_positions(positions, latest_prices),
         "latest_equity_point": latest_equity_point,
+        "trades": trades[-20:],
+        "skipped_count": len(skipped),
         "skipped": skipped,
     }
+
+
+def simulated_trade(
+    ts: str,
+    side: str,
+    market: str,
+    price: float,
+    quantity: float,
+    notional_krw: float,
+    fee_krw: float,
+) -> dict[str, Any]:
+    return {
+        "ts": ts,
+        "side": side,
+        "market": market,
+        "price": price,
+        "quantity": quantity,
+        "notional_krw": notional_krw,
+        "fee_krw": fee_krw,
+    }
+
+
+def unrealized_pnl(positions: dict[str, Position], latest_prices: dict[str, float]) -> float:
+    pnl = 0.0
+    for market, position in positions.items():
+        latest_price = latest_prices.get(market)
+        if latest_price is None:
+            continue
+        pnl += (latest_price - position.average_entry_price) * position.quantity
+    return pnl
+
+
+def duration_hours(first_ts: str | None, last_ts: str | None) -> float | None:
+    if first_ts is None or last_ts is None:
+        return None
+    return (parse_utc_datetime(last_ts) - parse_utc_datetime(first_ts)).total_seconds() / 3600
+
+
+def parse_utc_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def load_regimes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
