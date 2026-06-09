@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS orderbook_snapshots (
     bithumb_timestamp INTEGER,
     total_ask_size REAL,
     total_bid_size REAL,
+    best_ask_price REAL,
+    best_bid_price REAL,
+    spread_pct REAL,
+    ask_depth_5 REAL,
+    bid_depth_5 REAL,
+    imbalance_5 REAL,
     raw_json TEXT NOT NULL,
     FOREIGN KEY (market) REFERENCES markets (market)
 );
