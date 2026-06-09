@@ -1,0 +1,1 @@
+"""KaosTrade application package."""

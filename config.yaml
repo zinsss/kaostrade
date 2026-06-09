@@ -1,0 +1,18 @@
+project:
+  name: KaosTrade
+
+paths:
+  data: /app/data
+  logs: /app/logs
+  models: /app/models
+
+database:
+  path: /app/data/kaostrade.sqlite
+
+collector:
+  static_whitelist:
+    - KRW-BTC
+    - KRW-ETH
+    - KRW-XRP
+    - KRW-SOL
+    - KRW-DOGE

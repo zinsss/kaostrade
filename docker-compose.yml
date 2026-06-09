@@ -1,0 +1,13 @@
+services:
+  kaostrade:
+    build: .
+    container_name: kaostrade
+    user: "1000:1000"
+    environment:
+      - TZ=Asia/Seoul
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
