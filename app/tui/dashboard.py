@@ -33,6 +33,7 @@ def render_dashboard(db_path: str) -> Group:
 
     try:
         with connect(db_path) as conn:
+            regime_row = latest_regime(conn)
             ticker_rows = latest_tickers(conn)
             sparkline_by_market = latest_sparklines(conn)
             orderbook_rows = latest_orderbooks(conn)
@@ -42,6 +43,7 @@ def render_dashboard(db_path: str) -> Group:
 
     return Group(
         header(db_path),
+        regime_panel(regime_row),
         ticker_table(ticker_rows, sparkline_by_market),
         orderbook_table(orderbook_rows),
         candle_table(candle_rows),
@@ -56,6 +58,47 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def latest_regime(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT
+            ts,
+            regime,
+            reason,
+            btc_return_1h,
+            eth_return_1h,
+            median_return_1h,
+            positive_ratio,
+            average_spread_pct,
+            average_imbalance_5,
+            market_count
+        FROM market_regimes
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def regime_panel(row: sqlite3.Row | None) -> Panel:
+    if row is None:
+        return Panel("No regime yet", title="Market Regime")
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold")
+    table.add_column()
+    table.add_row("Regime", str(row["regime"]))
+    table.add_row("Reason", str(row["reason"]))
+    table.add_row("Timestamp", str(row["ts"]))
+    table.add_row("BTC 1h", format_percent(row["btc_return_1h"]))
+    table.add_row("ETH 1h", format_percent(row["eth_return_1h"]))
+    table.add_row("Median 1h", format_percent(row["median_return_1h"]))
+    table.add_row("Positive Ratio", format_percent(row["positive_ratio"]))
+    table.add_row("Avg Spread", format_percent(row["average_spread_pct"], scale=1))
+    table.add_row("Avg Imbalance 5", format_number(row["average_imbalance_5"]))
+    table.add_row("Market Count", str(row["market_count"] if row["market_count"] is not None else "-"))
+    return Panel(table, title="Market Regime")
 
 
 def latest_tickers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -232,10 +275,10 @@ def format_number(value: Any) -> str:
     return f"{float(value):,.8g}"
 
 
-def format_percent(value: Any) -> str:
+def format_percent(value: Any, scale: float = 100) -> str:
     if value is None:
         return "-"
-    return f"{float(value) * 100:,.2f}%"
+    return f"{float(value) * scale:,.2f}%"
 
 
 if __name__ == "__main__":
