@@ -241,6 +241,29 @@ def insert_candles(conn: sqlite3.Connection, candles: Iterable[dict[str, Any]], 
     return cursor.rowcount if cursor.rowcount != -1 else len(rows)
 
 
+def insert_market_features(conn: sqlite3.Connection, features: dict[str, Any]) -> int:
+    conn.execute(
+        """
+        INSERT INTO market_features (
+            ts, btc_return_1h, eth_return_1h, median_return_1h, positive_ratio,
+            average_spread_pct, average_imbalance_5, market_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            features["ts"],
+            _as_float(features.get("btc_return_1h")),
+            _as_float(features.get("eth_return_1h")),
+            _as_float(features.get("median_return_1h")),
+            _as_float(features.get("positive_ratio")),
+            _as_float(features.get("average_spread_pct")),
+            _as_float(features.get("average_imbalance_5")),
+            _as_int(features.get("market_count")),
+        ),
+    )
+    return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
 def _as_float(value: Any) -> float | None:
     if value is None:
         return None
