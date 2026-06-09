@@ -34,6 +34,7 @@ def render_dashboard(db_path: str) -> Group:
     try:
         with connect(db_path) as conn:
             regime_row = latest_regime(conn)
+            paper_state = load_paper_state(conn)
             ticker_rows = latest_tickers(conn)
             sparkline_by_market = latest_sparklines(conn)
             orderbook_rows = latest_orderbooks(conn)
@@ -44,6 +45,7 @@ def render_dashboard(db_path: str) -> Group:
     return Group(
         header(db_path),
         regime_panel(regime_row),
+        paper_trading_panel(paper_state),
         ticker_table(ticker_rows, sparkline_by_market),
         orderbook_table(orderbook_rows),
         candle_table(candle_rows),
@@ -99,6 +101,153 @@ def regime_panel(row: sqlite3.Row | None) -> Panel:
     table.add_row("Avg Imbalance 5", format_number(row["average_imbalance_5"]))
     table.add_row("Market Count", str(row["market_count"] if row["market_count"] is not None else "-"))
     return Panel(table, title="Market Regime")
+
+
+def load_paper_state(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    try:
+        account = conn.execute(
+            """
+            SELECT id, name, cash_krw, created_at, updated_at
+            FROM paper_accounts
+            WHERE name = ?
+            LIMIT 1
+            """,
+            ("default",),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return None
+        raise
+    if account is None:
+        return None
+
+    positions = conn.execute(
+        """
+        SELECT market, quantity, average_entry_price, updated_at
+        FROM paper_positions
+        WHERE account_id = ?
+        ORDER BY market
+        """,
+        (account["id"],),
+    ).fetchall()
+    trades = conn.execute(
+        """
+        SELECT ts, side, market, price, quantity, notional_krw, fee_krw
+        FROM paper_trades
+        WHERE account_id = ?
+        ORDER BY ts DESC, id DESC
+        LIMIT 5
+        """,
+        (account["id"],),
+    ).fetchall()
+    latest_prices = latest_ticker_prices(conn)
+
+    position_rows = []
+    total_position_value = 0.0
+    total_unrealized_pnl = 0.0
+    for position in positions:
+        quantity = float(position["quantity"])
+        average_entry_price = float(position["average_entry_price"])
+        latest_price = latest_prices.get(position["market"])
+        market_value = None
+        unrealized_pnl = None
+        if latest_price is not None:
+            market_value = quantity * latest_price
+            unrealized_pnl = (latest_price - average_entry_price) * quantity
+            total_position_value += market_value
+            total_unrealized_pnl += unrealized_pnl
+        position_rows.append(
+            {
+                "market": position["market"],
+                "quantity": quantity,
+                "average_entry_price": average_entry_price,
+                "latest_price": latest_price,
+                "market_value": market_value,
+                "unrealized_pnl": unrealized_pnl,
+            }
+        )
+
+    cash_krw = float(account["cash_krw"])
+    return {
+        "account": dict(account),
+        "cash_krw": cash_krw,
+        "total_position_value": total_position_value,
+        "total_unrealized_pnl": total_unrealized_pnl,
+        "total_equity_estimate": cash_krw + total_position_value,
+        "positions": position_rows,
+        "trades": [dict(trade) for trade in trades],
+    }
+
+
+def latest_ticker_prices(conn: sqlite3.Connection) -> dict[str, float]:
+    rows = conn.execute(
+        """
+        SELECT market, trade_price
+        FROM ticker_snapshots
+        WHERE id IN (
+            SELECT MAX(id)
+            FROM ticker_snapshots
+            WHERE trade_price IS NOT NULL
+            GROUP BY market
+        )
+        """
+    ).fetchall()
+    return {row["market"]: float(row["trade_price"]) for row in rows}
+
+
+def paper_trading_panel(state: dict[str, Any] | None) -> Panel:
+    if state is None:
+        return Panel("No paper account yet", title="Paper Trading")
+
+    summary = Table.grid(padding=(0, 2))
+    summary.add_column(style="bold")
+    summary.add_column(justify="right")
+    summary.add_row("Cash KRW", format_number(state["cash_krw"]))
+    summary.add_row("Position Value", format_number(state["total_position_value"]))
+    summary.add_row("Equity Estimate", format_number(state["total_equity_estimate"]))
+    summary.add_row("Unrealized PnL", format_number(state["total_unrealized_pnl"]))
+
+    positions = Table(title="Positions")
+    positions.add_column("Market")
+    positions.add_column("Quantity", justify="right")
+    positions.add_column("Avg Entry", justify="right")
+    positions.add_column("Latest Price", justify="right")
+    positions.add_column("Value", justify="right")
+    positions.add_column("Unrealized PnL", justify="right")
+    for position in state["positions"]:
+        positions.add_row(
+            position["market"],
+            format_number(position["quantity"]),
+            format_number(position["average_entry_price"]),
+            format_number(position["latest_price"]),
+            format_number(position["market_value"]),
+            format_number(position["unrealized_pnl"]),
+        )
+    if not state["positions"]:
+        positions.add_row("-", "-", "-", "-", "-", "-")
+
+    trades = Table(title="Latest Trades")
+    trades.add_column("Timestamp")
+    trades.add_column("Side")
+    trades.add_column("Market")
+    trades.add_column("Price", justify="right")
+    trades.add_column("Quantity", justify="right")
+    trades.add_column("Notional", justify="right")
+    trades.add_column("Fee", justify="right")
+    for trade in state["trades"]:
+        trades.add_row(
+            str(trade["ts"]),
+            str(trade["side"]),
+            str(trade["market"]),
+            format_number(trade["price"]),
+            format_number(trade["quantity"]),
+            format_number(trade["notional_krw"]),
+            format_number(trade["fee_krw"]),
+        )
+    if not state["trades"]:
+        trades.add_row("-", "-", "-", "-", "-", "-", "-")
+
+    return Panel(Group(summary, positions, trades), title="Paper Trading")
 
 
 def latest_tickers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
