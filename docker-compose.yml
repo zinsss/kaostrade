@@ -5,6 +5,7 @@ services:
     user: "1000:1000"
     environment:
       - TZ=Asia/Seoul
+    command: python -m app.collector.runner
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

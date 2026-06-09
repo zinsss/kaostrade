@@ -114,6 +114,38 @@ def insert_orderbook_snapshots(conn: sqlite3.Connection, orderbooks: Iterable[di
     return len(rows)
 
 
+def insert_candles(conn: sqlite3.Connection, candles: Iterable[dict[str, Any]], interval: str) -> int:
+    rows = [
+        (
+            candle["market"],
+            interval,
+            candle["candle_date_time_utc"],
+            candle.get("candle_date_time_kst"),
+            _as_float(candle.get("opening_price")),
+            _as_float(candle.get("high_price")),
+            _as_float(candle.get("low_price")),
+            _as_float(candle.get("trade_price")),
+            _as_float(candle.get("candle_acc_trade_price")),
+            _as_float(candle.get("candle_acc_trade_volume")),
+            _as_int(candle.get("timestamp")),
+            json.dumps(candle, ensure_ascii=False, sort_keys=True),
+        )
+        for candle in candles
+    ]
+    cursor = conn.executemany(
+        """
+        INSERT OR IGNORE INTO candles (
+            market, interval, candle_date_time_utc, candle_date_time_kst,
+            opening_price, high_price, low_price, trade_price,
+            candle_acc_trade_price, candle_acc_trade_volume, timestamp, raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return cursor.rowcount if cursor.rowcount != -1 else len(rows)
+
+
 def _as_float(value: Any) -> float | None:
     if value is None:
         return None
