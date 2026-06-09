@@ -74,7 +74,15 @@ def latest_tickers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def latest_orderbooks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT o.market, o.collected_at, o.total_ask_size, o.total_bid_size
+        SELECT
+            o.market,
+            o.collected_at,
+            o.best_bid_price,
+            o.best_ask_price,
+            o.spread_pct,
+            o.bid_depth_5,
+            o.ask_depth_5,
+            o.imbalance_5
         FROM orderbook_snapshots o
         JOIN (
             SELECT market, MAX(id) AS id
@@ -121,21 +129,29 @@ def ticker_table(rows: list[sqlite3.Row]) -> Table:
 
 
 def orderbook_table(rows: list[sqlite3.Row]) -> Table:
-    table = Table(title="Latest Orderbook Snapshots")
+    table = Table(title="Latest Orderbook Metrics")
     table.add_column("Market")
     table.add_column("Collected")
-    table.add_column("Total Ask", justify="right")
-    table.add_column("Total Bid", justify="right")
+    table.add_column("Best Bid", justify="right")
+    table.add_column("Best Ask", justify="right")
+    table.add_column("Spread %", justify="right")
+    table.add_column("Bid Depth 5 KRW", justify="right")
+    table.add_column("Ask Depth 5 KRW", justify="right")
+    table.add_column("Imbalance 5", justify="right")
 
     for row in rows:
         table.add_row(
             row["market"],
             row["collected_at"],
-            format_number(row["total_ask_size"]),
-            format_number(row["total_bid_size"]),
+            format_number(row["best_bid_price"]),
+            format_number(row["best_ask_price"]),
+            format_number(row["spread_pct"]),
+            format_number(row["bid_depth_5"]),
+            format_number(row["ask_depth_5"]),
+            format_number(row["imbalance_5"]),
         )
     if not rows:
-        table.add_row("-", "-", "-", "-")
+        table.add_row("-", "-", "-", "-", "-", "-", "-", "-")
     return table
 
 

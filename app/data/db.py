@@ -6,6 +6,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+ORDERBOOK_METRIC_COLUMNS = {
+    "best_ask_price": "REAL",
+    "best_bid_price": "REAL",
+    "spread_pct": "REAL",
+    "ask_depth_5": "REAL",
+    "bid_depth_5": "REAL",
+    "imbalance_5": "REAL",
+}
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -19,7 +27,15 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    migrate_orderbook_metric_columns(conn)
     conn.commit()
+
+
+def migrate_orderbook_metric_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(orderbook_snapshots)")}
+    for column, column_type in ORDERBOOK_METRIC_COLUMNS.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE orderbook_snapshots ADD COLUMN {column} {column_type}")
 
 
 def upsert_markets(conn: sqlite3.Connection, markets: Iterable[dict[str, Any]], collected_at: str) -> int:
@@ -91,27 +107,106 @@ def insert_ticker_snapshots(conn: sqlite3.Connection, tickers: Iterable[dict[str
 
 
 def insert_orderbook_snapshots(conn: sqlite3.Connection, orderbooks: Iterable[dict[str, Any]], collected_at: str) -> int:
-    rows = [
-        (
-            orderbook["market"],
-            collected_at,
-            _as_int(orderbook.get("timestamp")),
-            _as_float(orderbook.get("total_ask_size")),
-            _as_float(orderbook.get("total_bid_size")),
-            json.dumps(orderbook, ensure_ascii=False, sort_keys=True),
+    rows = []
+    for orderbook in orderbooks:
+        metrics = derive_orderbook_metrics(orderbook.get("orderbook_units", []))
+        rows.append(
+            (
+                orderbook["market"],
+                collected_at,
+                _as_int(orderbook.get("timestamp")),
+                _as_float(orderbook.get("total_ask_size")),
+                _as_float(orderbook.get("total_bid_size")),
+                metrics["best_ask_price"],
+                metrics["best_bid_price"],
+                metrics["spread_pct"],
+                metrics["ask_depth_5"],
+                metrics["bid_depth_5"],
+                metrics["imbalance_5"],
+                json.dumps(orderbook, ensure_ascii=False, sort_keys=True),
+            )
         )
-        for orderbook in orderbooks
-    ]
     conn.executemany(
         """
         INSERT INTO orderbook_snapshots (
-            market, collected_at, bithumb_timestamp, total_ask_size, total_bid_size, raw_json
+            market, collected_at, bithumb_timestamp, total_ask_size, total_bid_size,
+            best_ask_price, best_bid_price, spread_pct, ask_depth_5, bid_depth_5, imbalance_5,
+            raw_json
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     return len(rows)
+
+
+def derive_orderbook_metrics(orderbook_units: Any) -> dict[str, float | None]:
+    if not isinstance(orderbook_units, list) or not orderbook_units:
+        return _empty_orderbook_metrics()
+
+    ask_prices = _unit_values(orderbook_units, "ask_price")
+    bid_prices = _unit_values(orderbook_units, "bid_price")
+    best_ask_price = min(ask_prices) if ask_prices else None
+    best_bid_price = max(bid_prices) if bid_prices else None
+
+    if best_ask_price is not None and best_bid_price is not None and best_ask_price < best_bid_price:
+        best_ask_price, best_bid_price = best_bid_price, best_ask_price
+
+    spread_pct = None
+    if best_ask_price is not None and best_bid_price:
+        spread_pct = (best_ask_price - best_bid_price) / best_bid_price * 100
+
+    ask_depth_5 = _depth_krw(orderbook_units[:5], price_key="ask_price", size_key="ask_size")
+    bid_depth_5 = _depth_krw(orderbook_units[:5], price_key="bid_price", size_key="bid_size")
+    imbalance_5 = None
+    if ask_depth_5 is not None and bid_depth_5 is not None and ask_depth_5 + bid_depth_5 > 0:
+        imbalance_5 = bid_depth_5 / (bid_depth_5 + ask_depth_5)
+
+    return {
+        "best_ask_price": best_ask_price,
+        "best_bid_price": best_bid_price,
+        "spread_pct": spread_pct,
+        "ask_depth_5": ask_depth_5,
+        "bid_depth_5": bid_depth_5,
+        "imbalance_5": imbalance_5,
+    }
+
+
+def _empty_orderbook_metrics() -> dict[str, float | None]:
+    return {
+        "best_ask_price": None,
+        "best_bid_price": None,
+        "spread_pct": None,
+        "ask_depth_5": None,
+        "bid_depth_5": None,
+        "imbalance_5": None,
+    }
+
+
+def _unit_values(units: list[Any], key: str) -> list[float]:
+    values = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        value = _as_float(unit.get(key))
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _depth_krw(units: list[Any], price_key: str, size_key: str) -> float | None:
+    depth = 0.0
+    found = False
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        price = _as_float(unit.get(price_key))
+        size = _as_float(unit.get(size_key))
+        if price is None or size is None:
+            continue
+        depth += price * size
+        found = True
+    return depth if found else None
 
 
 def insert_candles(conn: sqlite3.Connection, candles: Iterable[dict[str, Any]], interval: str) -> int:
