@@ -12,6 +12,7 @@ from app.exchange.bithumb_public import BithumbPublicClient
 SUPPORTED_INTERVALS = ("1m", "5m", "15m", "1h")
 REQUEST_COUNT = 200
 REQUEST_SLEEP_SECONDS = 0.15
+PROGRESS_REQUEST_INTERVAL = 100
 
 
 def main() -> None:
@@ -39,23 +40,26 @@ def main() -> None:
                     interval=args.interval,
                     days=args.days,
                     sleep_seconds=args.sleep_seconds,
+                    resume=args.resume,
                 )
                 total_inserted += result["inserted"]
                 oldest_seen = min_timestamp(oldest_seen, result["oldest"])
                 newest_seen = max_timestamp(newest_seen, result["newest"])
                 print(
                     f"market={market['market']} interval={args.interval} "
-                    f"inserted={result['inserted']} oldest={result['oldest'] or '-'}",
+                    f"inserted={result['inserted']} oldest={result['oldest'] or '-'} "
+                    f"newest={result['newest'] or '-'} requests={result['requests']}",
                     flush=True,
                 )
 
     elapsed_seconds = time.monotonic() - started_at
     print(
         "summary "
+        f"requested_days={args.days} "
         f"markets_processed={len(markets)} "
         f"candles_inserted={total_inserted} "
-        f"oldest_timestamp={oldest_seen or '-'} "
-        f"newest_timestamp={newest_seen or '-'} "
+        f"actual_oldest_timestamp={oldest_seen or '-'} "
+        f"actual_newest_timestamp={newest_seen or '-'} "
         f"elapsed_seconds={elapsed_seconds:.2f}",
         flush=True,
     )
@@ -69,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval", choices=SUPPORTED_INTERVALS, required=True)
     parser.add_argument("--days", type=positive_int, required=True)
     parser.add_argument("--sleep-seconds", type=non_negative_float, default=REQUEST_SLEEP_SECONDS)
+    parser.add_argument("--resume", action="store_true", help="Continue backward from the oldest existing candle")
     return parser.parse_args()
 
 
@@ -129,16 +134,34 @@ def backfill_market(
     interval: str,
     days: int,
     sleep_seconds: float,
+    resume: bool,
 ) -> dict[str, Any]:
     target_oldest = datetime.now(timezone.utc) - timedelta(days=days)
-    page_to = None
+    existing_bounds = candle_bounds(conn, market, interval)
+    page_to = existing_bounds["oldest"] if resume and existing_bounds["oldest"] else None
+    if resume and page_to and parse_utc_datetime(page_to) <= target_oldest:
+        return {
+            "inserted": 0,
+            "oldest": existing_bounds["oldest"],
+            "newest": existing_bounds["newest"],
+            "requests": 0,
+        }
+
     inserted = 0
-    oldest = None
-    newest = None
+    oldest = existing_bounds["oldest"] if resume else None
+    newest = existing_bounds["newest"] if resume else None
     seen_oldest = None
+    request_count = 0
 
     while True:
         candles = bithumb.get_candles(market=market, interval=interval, count=REQUEST_COUNT, to=page_to)
+        request_count += 1
+        if request_count % PROGRESS_REQUEST_INTERVAL == 0:
+            print(
+                f"progress market={market} interval={interval} requests={request_count} "
+                f"inserted={inserted} oldest={oldest or '-'} target_oldest={format_utc(target_oldest)}",
+                flush=True,
+            )
         if not candles:
             break
 
@@ -162,7 +185,31 @@ def backfill_market(
         page_to = page_oldest
         time.sleep(sleep_seconds)
 
-    return {"inserted": inserted, "oldest": oldest, "newest": newest}
+    actual_bounds = candle_bounds(conn, market, interval)
+    return {
+        "inserted": inserted,
+        "oldest": actual_bounds["oldest"] or oldest,
+        "newest": actual_bounds["newest"] or newest,
+        "requests": request_count,
+    }
+
+
+def candle_bounds(conn, market: str, interval: str) -> dict[str, str | None]:
+    row = conn.execute(
+        """
+        SELECT
+            min(candle_date_time_utc) AS oldest,
+            max(candle_date_time_utc) AS newest
+        FROM candles
+        WHERE market = ? AND interval = ?
+        """,
+        (market, interval),
+    ).fetchone()
+    return {"oldest": row["oldest"], "newest": row["newest"]}
+
+
+def format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def min_timestamp(left: str | None, right: str | None) -> str | None:
