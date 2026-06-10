@@ -18,7 +18,7 @@ from app.regime.rule_based import classify_features
 CONFIG_PATH = Path("/app/config.yaml")
 DEFAULT_DB_PATH = "/app/data/kaostrade.sqlite"
 DEFAULT_STEP_MINUTES = 5
-DEFAULT_TOLERANCE_MINUTES = 5
+DEFAULT_TOLERANCE_MINUTES = 15
 BACKFILL_SOURCE = "backfill"
 
 
@@ -103,19 +103,12 @@ def backfill_features_and_regimes(
             summary["features_inserted"] += 1
         else:
             features = dict(existing_feature)
-            if missing_4h_features(features):
-                refreshed_features = historical_features(conn, markets, ts, tolerance_minutes, summary["skipped_reasons"])
-                if refreshed_features is not None:
-                    update_market_feature_4h(conn, features["id"], refreshed_features)
-                    conn.commit()
-                    features.update(
-                        {
-                            "btc_return_4h": refreshed_features.get("btc_return_4h"),
-                            "eth_return_4h": refreshed_features.get("eth_return_4h"),
-                            "median_return_4h": refreshed_features.get("median_return_4h"),
-                        }
-                    )
-                    summary["features_updated"] += 1
+            refreshed_features = historical_features(conn, markets, ts, tolerance_minutes, summary["skipped_reasons"])
+            if refreshed_features is not None:
+                update_market_feature_values(conn, features["id"], refreshed_features)
+                conn.commit()
+                features.update(refreshed_features)
+                summary["features_updated"] += 1
             summary["features_existing"] += 1
 
         if market_regime_by_ts(conn, ts, BACKFILL_SOURCE) is not None:
@@ -148,10 +141,9 @@ def backfill_features_and_regimes(
 
 def skipped_reason_counts() -> dict[str, int]:
     return {
-        "missing_current_candle": 0,
-        "missing_1h_reference_candle": 0,
-        "missing_4h_reference_candle": 0,
-        "tolerance_exceeded": 0,
+        "missing_current_candle_within_tolerance": 0,
+        "missing_1h_reference_within_tolerance": 0,
+        "missing_4h_reference_within_tolerance": 0,
     }
 
 
@@ -273,21 +265,15 @@ def historical_returns(
 ) -> dict[str, float]:
     current_time = parse_utc_datetime(ts)
     target_time = current_time - timedelta(hours=lookback_hours)
-    reference_reason = f"missing_{lookback_hours}h_reference_candle"
+    reference_reason = f"missing_{lookback_hours}h_reference_within_tolerance"
     returns = {}
 
     for market in markets:
-        current_price = exact_candle_price(conn, market, ts)
+        current_price = nearest_candle_price(conn, market, current_time, tolerance_minutes)
         if current_price is None or current_price <= 0:
-            skipped_reasons["missing_current_candle"] += 1
+            skipped_reasons["missing_current_candle_within_tolerance"] += 1
             continue
-        comparison, reason = reference_candle_price(conn, market, target_time, tolerance_minutes)
-        if reason is not None:
-            if reason == "missing_reference_candle":
-                skipped_reasons[reference_reason] += 1
-            else:
-                skipped_reasons[reason] += 1
-            continue
+        comparison = nearest_candle_price(conn, market, target_time, tolerance_minutes)
         if comparison is None or comparison <= 0:
             skipped_reasons[reference_reason] += 1
             continue
@@ -296,63 +282,32 @@ def historical_returns(
     return returns
 
 
-def exact_candle_price(conn: sqlite3.Connection, market: str, ts: str) -> float | None:
-    row = conn.execute(
-        """
-        SELECT trade_price
-        FROM candles
-        WHERE market = ?
-          AND interval = '1m'
-          AND candle_date_time_utc = ?
-          AND trade_price IS NOT NULL
-        LIMIT 1
-        """,
-        (market, ts),
-    ).fetchone()
-    return float(row["trade_price"]) if row is not None else None
-
-
-def reference_candle_price(
+def nearest_candle_price(
     conn: sqlite3.Connection,
     market: str,
     target_time: datetime,
     tolerance_minutes: int,
-) -> tuple[float | None, str | None]:
-    before = conn.execute(
+) -> float | None:
+    tolerance = timedelta(minutes=tolerance_minutes)
+    rows = conn.execute(
         """
         SELECT trade_price, candle_date_time_utc
         FROM candles
         WHERE market = ?
           AND interval = '1m'
           AND trade_price IS NOT NULL
-          AND candle_date_time_utc <= ?
-        ORDER BY candle_date_time_utc DESC
-        LIMIT 1
+          AND candle_date_time_utc BETWEEN ? AND ?
         """,
-        (market, format_utc(target_time)),
-    ).fetchone()
-    after = conn.execute(
-        """
-        SELECT trade_price, candle_date_time_utc
-        FROM candles
-        WHERE market = ?
-          AND interval = '1m'
-          AND trade_price IS NOT NULL
-          AND candle_date_time_utc >= ?
-        ORDER BY candle_date_time_utc ASC
-        LIMIT 1
-        """,
-        (market, format_utc(target_time)),
-    ).fetchone()
-    candidates = [row for row in (before, after) if row is not None]
-    if not candidates:
-        return None, "missing_reference_candle"
-
-    closest = min(candidates, key=lambda row: abs(parse_utc_datetime(row["candle_date_time_utc"]) - target_time))
-    distance = abs(parse_utc_datetime(closest["candle_date_time_utc"]) - target_time)
-    if distance > timedelta(minutes=tolerance_minutes):
-        return None, "tolerance_exceeded"
-    return float(closest["trade_price"]), None
+        (
+            market,
+            format_utc(target_time - tolerance),
+            format_utc(target_time + tolerance),
+        ),
+    ).fetchall()
+    if not rows:
+        return None
+    closest = min(rows, key=lambda row: abs(parse_utc_datetime(row["candle_date_time_utc"]) - target_time))
+    return float(closest["trade_price"])
 
 
 def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqlite3.Row | None:
@@ -381,25 +336,30 @@ def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqli
     ).fetchone()
 
 
-def missing_4h_features(features: dict[str, Any]) -> bool:
-    return (
-        features.get("btc_return_4h") is None
-        or features.get("eth_return_4h") is None
-        or features.get("median_return_4h") is None
-    )
-
-
-def update_market_feature_4h(conn: sqlite3.Connection, feature_id: int, features: dict[str, Any]) -> None:
+def update_market_feature_values(conn: sqlite3.Connection, feature_id: int, features: dict[str, Any]) -> None:
     conn.execute(
         """
         UPDATE market_features
-        SET btc_return_4h = ?, eth_return_4h = ?, median_return_4h = ?
+        SET
+            btc_return_1h = ?,
+            eth_return_1h = ?,
+            median_return_1h = ?,
+            btc_return_4h = ?,
+            eth_return_4h = ?,
+            median_return_4h = ?,
+            positive_ratio = ?,
+            market_count = ?
         WHERE id = ?
         """,
         (
+            features.get("btc_return_1h"),
+            features.get("eth_return_1h"),
+            features.get("median_return_1h"),
             features.get("btc_return_4h"),
             features.get("eth_return_4h"),
             features.get("median_return_4h"),
+            features.get("positive_ratio"),
+            features.get("market_count"),
             feature_id,
         ),
     )
