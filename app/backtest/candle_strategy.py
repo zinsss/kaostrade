@@ -24,7 +24,15 @@ DEFAULT_TAKE_PROFIT_PCT = 0.0
 DEFAULT_STOP_LOSS_PCT = 0.0
 RISK_SWEEP_TAKE_PROFIT_PCTS = (0.0, 0.5, 1.0, 1.5)
 RISK_SWEEP_STOP_LOSS_PCTS = (0.0, 0.5, 1.0)
-STRATEGIES = ("ema", "bollinger", "rsi", "ema_rsi", "donchian")
+STRATEGIES = (
+    "ema",
+    "bollinger",
+    "rsi",
+    "ema_rsi",
+    "donchian",
+    "bollinger_rsi_and",
+    "bollinger_rsi_or",
+)
 EMA_FAST = 20
 EMA_SLOW = 50
 DEFAULT_BOLLINGER_PERIOD = 20
@@ -592,8 +600,8 @@ def run_backtest(
         "strategy": strategy,
         "markets": markets,
         "min_signal_gap_minutes": min_signal_gap_minutes,
-        "bollinger_period": bollinger_period if strategy == "bollinger" else None,
-        "bollinger_stddev": bollinger_stddev if strategy == "bollinger" else None,
+        "bollinger_period": bollinger_period if strategy.startswith("bollinger") else None,
+        "bollinger_stddev": bollinger_stddev if strategy.startswith("bollinger") else None,
         "take_profit_pct": take_profit_pct,
         "stop_loss_pct": stop_loss_pct,
         "rsi_buy_threshold": rsi_buy_threshold,
@@ -662,6 +670,24 @@ def strategy_signals(
         return ema_rsi_signals(candles)
     if strategy == "donchian":
         return donchian_signals(candles)
+    if strategy == "bollinger_rsi_and":
+        return bollinger_rsi_signals(
+            candles,
+            period=bollinger_period,
+            stddev=bollinger_stddev,
+            rsi_buy_threshold=rsi_buy_threshold,
+            rsi_sell_threshold=rsi_sell_threshold,
+            buy_mode="and",
+        )
+    if strategy == "bollinger_rsi_or":
+        return bollinger_rsi_signals(
+            candles,
+            period=bollinger_period,
+            stddev=bollinger_stddev,
+            rsi_buy_threshold=rsi_buy_threshold,
+            rsi_sell_threshold=rsi_sell_threshold,
+            buy_mode="or",
+        )
     raise ValueError(f"Unsupported strategy: {strategy}")
 
 
@@ -697,6 +723,45 @@ def rsi_signals(candles: list[Candle], buy_threshold: float, sell_threshold: flo
         if value < buy_threshold:
             signals.append(signal_event(candles[index], "BUY"))
         elif value > sell_threshold:
+            signals.append(signal_event(candles[index], "SELL"))
+    return signals
+
+
+def bollinger_rsi_signals(
+    candles: list[Candle],
+    period: int,
+    stddev: float,
+    rsi_buy_threshold: float,
+    rsi_sell_threshold: float,
+    buy_mode: str,
+) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    rsi = rsi_series(prices, RSI_PERIOD)
+    signals = []
+    for index in range(period, len(candles)):
+        previous_window = prices[index - period:index]
+        current_window = prices[index - period + 1:index + 1]
+        previous_middle = mean(previous_window)
+        previous_lower = previous_middle - stddev * pstdev(previous_window)
+        current_middle = mean(current_window)
+        current_lower = current_middle - stddev * pstdev(current_window)
+        previous_price = prices[index - 1]
+        current_price = prices[index]
+        current_rsi = rsi[index]
+        if current_rsi is None:
+            continue
+
+        bollinger_buy = previous_price <= previous_lower and current_price > current_lower
+        bollinger_sell = previous_price >= previous_middle and current_price < current_middle
+        rsi_buy = current_rsi < rsi_buy_threshold
+        rsi_sell = current_rsi > rsi_sell_threshold
+        buy_signal = (
+            (buy_mode == "and" and bollinger_buy and rsi_buy)
+            or (buy_mode == "or" and (bollinger_buy or rsi_buy))
+        )
+        if buy_signal:
+            signals.append(signal_event(candles[index], "BUY"))
+        elif bollinger_sell or rsi_sell:
             signals.append(signal_event(candles[index], "SELL"))
     return signals
 
