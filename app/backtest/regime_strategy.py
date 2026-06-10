@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from app.collector.collect_once import CONFIG_PATH, DEFAULT_DB_PATH, load_config
+from app.regime.classifiers import CLASSIFIER_NAMES, get_classifier
 
 START_CASH_KRW = 1_000_000.0
 DEFAULT_ENTRY_STREAK = 3
@@ -20,6 +21,7 @@ DEFAULT_TRADE_NOTIONAL_KRW = 10_000.0
 DEFAULT_FEE_RATE = 0.0005
 DEFAULT_MAX_PRICE_DISTANCE_SECONDS = 300
 DEFAULT_SOURCE = "backfill"
+DEFAULT_REGIME_CLASSIFIER = "basic"
 MARKETS = ("KRW-BTC", "KRW-ETH")
 
 
@@ -32,6 +34,7 @@ class BacktestSettings:
     fee_rate: float = DEFAULT_FEE_RATE
     max_price_distance_seconds: int = DEFAULT_MAX_PRICE_DISTANCE_SECONDS
     source: str = DEFAULT_SOURCE
+    regime_classifier: str = DEFAULT_REGIME_CLASSIFIER
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -42,6 +45,7 @@ class BacktestSettings:
             "fee_rate": self.fee_rate,
             "max_price_distance_seconds": self.max_price_distance_seconds,
             "source": self.source,
+            "regime_classifier": self.regime_classifier,
         }
 
 
@@ -58,6 +62,9 @@ def main() -> None:
     db_path = config.get("database", {}).get("path", DEFAULT_DB_PATH)
 
     with connect_read_only(db_path) as conn:
+        if args.compare_classifiers:
+            print_classifier_comparison(conn, args)
+            return
         if args.compare:
             print_comparison(conn, args)
             return
@@ -75,7 +82,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fee-rate", type=non_negative_float, default=DEFAULT_FEE_RATE)
     parser.add_argument("--max-price-distance-seconds", type=positive_int, default=DEFAULT_MAX_PRICE_DISTANCE_SECONDS)
     parser.add_argument("--source", choices=("backfill", "live", "all"), default=DEFAULT_SOURCE)
+    parser.add_argument("--regime-classifier", choices=CLASSIFIER_NAMES, default=DEFAULT_REGIME_CLASSIFIER)
     parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--compare-classifiers", action="store_true")
     return parser.parse_args()
 
 
@@ -109,7 +118,41 @@ def settings_from_args(args: argparse.Namespace) -> BacktestSettings:
         fee_rate=args.fee_rate,
         max_price_distance_seconds=args.max_price_distance_seconds,
         source=args.source,
+        regime_classifier=args.regime_classifier,
     )
+
+
+def print_classifier_comparison(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    table = Table(title="Regime Classifier Comparison")
+    table.add_column("classifier")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for classifier_name in CLASSIFIER_NAMES:
+        settings = BacktestSettings(
+            mode=args.mode,
+            entry_streak=args.entry_streak,
+            exit_streak=args.exit_streak,
+            trade_notional_krw=args.trade_notional_krw,
+            fee_rate=args.fee_rate,
+            max_price_distance_seconds=args.max_price_distance_seconds,
+            source=args.source,
+            regime_classifier=classifier_name,
+        )
+        summary = run_backtest(conn, settings)
+        table.add_row(
+            classifier_name,
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_optional_float(summary["average_hold_minutes"]),
+            format_float(summary["max_drawdown_pct"]),
+        )
+
+    Console(width=140).print(table)
 
 
 def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
@@ -132,6 +175,7 @@ def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace) -> None
             fee_rate=args.fee_rate,
             max_price_distance_seconds=args.max_price_distance_seconds,
             source=args.source,
+            regime_classifier=args.regime_classifier,
         )
         summary = run_backtest(conn, settings)
         table.add_row(
@@ -183,7 +227,7 @@ def run_backtest(conn: sqlite3.Connection, settings: BacktestSettings | None = N
     risk_on_streak = 0
     risk_off_streak = 0
 
-    regimes = load_regimes(conn, settings.source)
+    regimes = load_classified_regimes(conn, settings)
     for regime_row in regimes:
         ts = str(regime_row["ts"])
         regime = str(regime_row["regime"])
@@ -376,25 +420,44 @@ def parse_utc_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def load_regimes(conn: sqlite3.Connection, source: str = DEFAULT_SOURCE) -> list[sqlite3.Row]:
-    if source == "all":
-        return conn.execute(
-            """
-            SELECT id, ts, regime
-            FROM market_regimes
-            ORDER BY ts ASC, id ASC
-            """
-        ).fetchall()
+def load_classified_regimes(conn: sqlite3.Connection, settings: BacktestSettings) -> list[dict[str, Any]]:
+    classifier = get_classifier(settings.regime_classifier)
+    regimes = []
+    for feature_row in load_market_features(conn, settings.source):
+        regime, reason = classifier(feature_row)
+        regimes.append(
+            {
+                "id": feature_row["id"],
+                "ts": feature_row["ts"],
+                "regime": regime,
+                "reason": reason,
+            }
+        )
+    return regimes
 
-    return conn.execute(
-        """
-        SELECT id, ts, regime
-        FROM market_regimes
-        WHERE source = ?
-        ORDER BY ts ASC, id ASC
-        """,
-        (source,),
-    ).fetchall()
+
+def load_market_features(conn: sqlite3.Connection, source: str = DEFAULT_SOURCE) -> list[sqlite3.Row]:
+    base_query = """
+        SELECT
+            id,
+            ts,
+            source,
+            btc_return_1h,
+            eth_return_1h,
+            median_return_1h,
+            btc_return_4h,
+            eth_return_4h,
+            median_return_4h,
+            positive_ratio,
+            average_spread_pct,
+            average_imbalance_5,
+            market_count
+        FROM market_features
+    """
+    if source == "all":
+        return conn.execute(base_query + " ORDER BY ts ASC, id ASC").fetchall()
+
+    return conn.execute(base_query + " WHERE source = ? ORDER BY ts ASC, id ASC", (source,)).fetchall()
 
 
 def prices_near_timestamp(

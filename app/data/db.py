@@ -15,6 +15,11 @@ ORDERBOOK_METRIC_COLUMNS = {
     "imbalance_5": "REAL",
 }
 SOURCE_TABLES = ("market_features", "market_regimes")
+MARKET_FEATURE_COLUMNS = {
+    "btc_return_4h": "REAL",
+    "eth_return_4h": "REAL",
+    "median_return_4h": "REAL",
+}
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -29,6 +34,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
     migrate_orderbook_metric_columns(conn)
+    migrate_market_feature_columns(conn)
     migrate_source_columns(conn)
     conn.commit()
 
@@ -38,6 +44,13 @@ def migrate_orderbook_metric_columns(conn: sqlite3.Connection) -> None:
     for column, column_type in ORDERBOOK_METRIC_COLUMNS.items():
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE orderbook_snapshots ADD COLUMN {column} {column_type}")
+
+
+def migrate_market_feature_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(market_features)")}
+    for column, column_type in MARKET_FEATURE_COLUMNS.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE market_features ADD COLUMN {column} {column_type}")
 
 
 def migrate_source_columns(conn: sqlite3.Connection) -> None:
@@ -256,10 +269,11 @@ def insert_market_features(conn: sqlite3.Connection, features: dict[str, Any]) -
     conn.execute(
         """
         INSERT INTO market_features (
-            ts, source, btc_return_1h, eth_return_1h, median_return_1h, positive_ratio,
-            average_spread_pct, average_imbalance_5, market_count
+            ts, source, btc_return_1h, eth_return_1h, median_return_1h,
+            btc_return_4h, eth_return_4h, median_return_4h,
+            positive_ratio, average_spread_pct, average_imbalance_5, market_count
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             features["ts"],
@@ -267,6 +281,9 @@ def insert_market_features(conn: sqlite3.Connection, features: dict[str, Any]) -
             _as_float(features.get("btc_return_1h")),
             _as_float(features.get("eth_return_1h")),
             _as_float(features.get("median_return_1h")),
+            _as_float(features.get("btc_return_4h")),
+            _as_float(features.get("eth_return_4h")),
+            _as_float(features.get("median_return_4h")),
             _as_float(features.get("positive_ratio")),
             _as_float(features.get("average_spread_pct")),
             _as_float(features.get("average_imbalance_5")),

@@ -80,6 +80,7 @@ def backfill_features_and_regimes(
         "features_existing": 0,
         "regimes_inserted": 0,
         "regimes_existing": 0,
+        "features_updated": 0,
         "skipped_count": 0,
         "first_ts": timestamps[0] if timestamps else None,
         "last_ts": timestamps[-1] if timestamps else None,
@@ -98,6 +99,19 @@ def backfill_features_and_regimes(
             summary["features_inserted"] += 1
         else:
             features = dict(existing_feature)
+            if missing_4h_features(features):
+                refreshed_features = historical_features(conn, markets, ts, tolerance_minutes)
+                if refreshed_features is not None:
+                    update_market_feature_4h(conn, features["id"], refreshed_features)
+                    conn.commit()
+                    features.update(
+                        {
+                            "btc_return_4h": refreshed_features.get("btc_return_4h"),
+                            "eth_return_4h": refreshed_features.get("eth_return_4h"),
+                            "median_return_4h": refreshed_features.get("median_return_4h"),
+                        }
+                    )
+                    summary["features_updated"] += 1
             summary["features_existing"] += 1
 
         if market_regime_by_ts(conn, ts, BACKFILL_SOURCE) is not None:
@@ -175,32 +189,38 @@ def historical_features(
     ts: str,
     tolerance_minutes: int,
 ) -> dict[str, Any] | None:
-    returns_by_market = historical_1h_returns(conn, markets, ts, tolerance_minutes)
-    returns = list(returns_by_market.values())
-    if not returns:
+    returns_1h_by_market = historical_returns(conn, markets, ts, lookback_hours=1, tolerance_minutes=tolerance_minutes)
+    returns_4h_by_market = historical_returns(conn, markets, ts, lookback_hours=4, tolerance_minutes=tolerance_minutes)
+    returns_1h = list(returns_1h_by_market.values())
+    returns_4h = list(returns_4h_by_market.values())
+    if not returns_1h:
         return None
 
     return {
         "ts": ts,
         "source": BACKFILL_SOURCE,
-        "btc_return_1h": returns_by_market.get("KRW-BTC"),
-        "eth_return_1h": returns_by_market.get("KRW-ETH"),
-        "median_return_1h": median(returns),
-        "positive_ratio": positive_ratio(returns),
+        "btc_return_1h": returns_1h_by_market.get("KRW-BTC"),
+        "eth_return_1h": returns_1h_by_market.get("KRW-ETH"),
+        "median_return_1h": median(returns_1h),
+        "btc_return_4h": returns_4h_by_market.get("KRW-BTC"),
+        "eth_return_4h": returns_4h_by_market.get("KRW-ETH"),
+        "median_return_4h": median(returns_4h) if returns_4h else None,
+        "positive_ratio": positive_ratio(returns_1h),
         "average_spread_pct": None,
         "average_imbalance_5": None,
-        "market_count": len(returns),
+        "market_count": len(returns_1h),
     }
 
 
-def historical_1h_returns(
+def historical_returns(
     conn: sqlite3.Connection,
     markets: list[str],
     ts: str,
+    lookback_hours: int,
     tolerance_minutes: int,
 ) -> dict[str, float]:
     current_time = parse_utc_datetime(ts)
-    target_time = current_time - timedelta(hours=1)
+    target_time = current_time - timedelta(hours=lookback_hours)
     returns = {}
 
     for market in markets:
@@ -269,6 +289,9 @@ def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqli
             btc_return_1h,
             eth_return_1h,
             median_return_1h,
+            btc_return_4h,
+            eth_return_4h,
+            median_return_4h,
             positive_ratio,
             average_spread_pct,
             average_imbalance_5,
@@ -280,6 +303,30 @@ def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqli
         """,
         (ts, source),
     ).fetchone()
+
+
+def missing_4h_features(features: dict[str, Any]) -> bool:
+    return (
+        features.get("btc_return_4h") is None
+        and features.get("eth_return_4h") is None
+        and features.get("median_return_4h") is None
+    )
+
+
+def update_market_feature_4h(conn: sqlite3.Connection, feature_id: int, features: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        UPDATE market_features
+        SET btc_return_4h = ?, eth_return_4h = ?, median_return_4h = ?
+        WHERE id = ?
+        """,
+        (
+            features.get("btc_return_4h"),
+            features.get("eth_return_4h"),
+            features.get("median_return_4h"),
+            feature_id,
+        ),
+    )
 
 
 def market_regime_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqlite3.Row | None:
@@ -305,6 +352,7 @@ def empty_summary(markets: list[str], days: int, step_minutes: int, reason: str)
         "features_existing": 0,
         "regimes_inserted": 0,
         "regimes_existing": 0,
+        "features_updated": 0,
         "skipped_count": 0,
         "first_ts": None,
         "last_ts": None,
