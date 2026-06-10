@@ -76,12 +76,18 @@ def classify_features(features: sqlite3.Row) -> tuple[str, str]:
     positive_ratio = features["positive_ratio"]
     average_spread_pct = features["average_spread_pct"]
 
+    spread_ok = average_spread_pct is None or _lte(average_spread_pct, 0.25)
     if (
         _gt(btc_return_1h, 0)
         and _gt(median_return_1h, 0)
         and _gte(positive_ratio, 0.6)
-        and _lte(average_spread_pct, 0.25)
+        and spread_ok
     ):
+        if average_spread_pct is None:
+            return (
+                "RISK_ON",
+                "BTC and median 1h returns are positive and positive_ratio is at least 0.60; average spread is unavailable.",
+            )
         return (
             "RISK_ON",
             "BTC and median 1h returns are positive, positive_ratio is at least 0.60, and average spread is at most 0.25%.",
