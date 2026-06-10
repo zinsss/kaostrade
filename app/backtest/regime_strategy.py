@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -20,16 +21,24 @@ MARKETS = ("KRW-BTC", "KRW-ETH")
 class Position:
     quantity: float
     average_entry_price: float
+    entry_ts: str
 
 
 def main() -> None:
+    args = parse_args()
     config = load_config(CONFIG_PATH)
     db_path = config.get("database", {}).get("path", DEFAULT_DB_PATH)
 
     with connect_read_only(db_path) as conn:
-        summary = run_backtest(conn)
+        summary = run_backtest(conn, mode=args.mode)
 
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Backtest the regime strategy.")
+    parser.add_argument("--mode", choices=("simple", "persistent"), default="persistent")
+    return parser.parse_args()
 
 
 def connect_read_only(db_path: str) -> sqlite3.Connection:
@@ -40,7 +49,7 @@ def connect_read_only(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
+def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str, Any]:
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
     buy_count = 0
@@ -48,9 +57,12 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
     realized_pnl_krw = 0.0
     total_fees_krw = 0.0
     trades: list[dict[str, Any]] = []
+    hold_minutes: list[float] = []
     equity_curve: list[dict[str, Any]] = []
     skipped: list[str] = []
     regime_counts = {"RISK_ON": 0, "NEUTRAL": 0, "RISK_OFF": 0}
+    risk_on_streak = 0
+    risk_off_streak = 0
 
     regimes = load_regimes(conn)
     for regime_row in regimes:
@@ -58,6 +70,8 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
         regime = str(regime_row["regime"])
         if regime in regime_counts:
             regime_counts[regime] += 1
+        risk_on_streak, risk_off_streak = update_regime_streaks(regime, risk_on_streak, risk_off_streak)
+        action_regime = action_regime_for_mode(mode, regime, risk_on_streak, risk_off_streak)
         price_result = prices_near_timestamp(conn, ts, MARKETS)
         prices = price_result["prices"]
         skipped.extend(f"{ts}: {reason}" for reason in price_result["skipped"])
@@ -65,7 +79,7 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
         if missing_prices:
             skipped.append(f"{ts}: missing prices for {', '.join(missing_prices)}")
 
-        if regime == "RISK_ON":
+        if action_regime == "RISK_ON":
             for market in MARKETS:
                 if market in positions:
                     continue
@@ -79,7 +93,7 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
                 quantity = TRADE_NOTIONAL_KRW / price
                 fee_krw = TRADE_NOTIONAL_KRW * FEE_RATE
                 cash -= total_cost
-                positions[market] = Position(quantity=quantity, average_entry_price=price)
+                positions[market] = Position(quantity=quantity, average_entry_price=price, entry_ts=ts)
                 total_fees_krw += fee_krw
                 buy_count += 1
                 trades.append(
@@ -93,7 +107,7 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
                         fee_krw=fee_krw,
                     )
                 )
-        elif regime == "RISK_OFF":
+        elif action_regime == "RISK_OFF":
             for market in list(positions):
                 price = prices.get(market)
                 if price is None:
@@ -103,6 +117,7 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
                 fee_krw = notional * FEE_RATE
                 cash += notional - fee_krw
                 realized_pnl_krw += notional - fee_krw - (position.quantity * position.average_entry_price)
+                hold_minutes.append(position_hold_minutes(position, ts))
                 total_fees_krw += fee_krw
                 sell_count += 1
                 trades.append(
@@ -116,7 +131,7 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
                         fee_krw=fee_krw,
                     )
                 )
-        elif regime == "NEUTRAL":
+        elif action_regime == "NEUTRAL":
             pass
         else:
             skipped.append(f"{ts}: unsupported regime {regime}")
@@ -142,6 +157,7 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
         latest_equity_point["cash"] = cash
 
     return {
+        "mode": mode,
         "start_cash": START_CASH_KRW,
         "final_equity": final_equity,
         "return_pct": (final_equity - START_CASH_KRW) / START_CASH_KRW * 100,
@@ -154,6 +170,9 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
         "first_ts": first_ts,
         "last_ts": last_ts,
         "duration_hours": duration_hours(first_ts, last_ts),
+        "average_hold_minutes": average_hold_minutes(hold_minutes),
+        "longest_hold_minutes": max(hold_minutes) if hold_minutes else None,
+        "shortest_hold_minutes": min(hold_minutes) if hold_minutes else None,
         "regime_counts": regime_counts,
         "max_drawdown_pct": max_drawdown_pct(equity_curve),
         "positions": serialize_positions(positions, latest_prices),
@@ -162,6 +181,36 @@ def run_backtest(conn: sqlite3.Connection) -> dict[str, Any]:
         "skipped_count": len(skipped),
         "skipped": skipped,
     }
+
+
+def update_regime_streaks(regime: str, risk_on_streak: int, risk_off_streak: int) -> tuple[int, int]:
+    if regime == "RISK_ON":
+        return risk_on_streak + 1, 0
+    if regime == "RISK_OFF":
+        return 0, risk_off_streak + 1
+    return 0, 0
+
+
+def action_regime_for_mode(mode: str, regime: str, risk_on_streak: int, risk_off_streak: int) -> str:
+    if mode == "simple":
+        return regime
+    if mode != "persistent":
+        raise ValueError(f"Unsupported backtest mode: {mode}")
+    if regime == "RISK_ON" and risk_on_streak >= 3:
+        return "RISK_ON"
+    if regime == "RISK_OFF" and risk_off_streak >= 3:
+        return "RISK_OFF"
+    return "NEUTRAL"
+
+
+def position_hold_minutes(position: Position, exit_ts: str) -> float:
+    return (parse_utc_datetime(exit_ts) - parse_utc_datetime(position.entry_ts)).total_seconds() / 60
+
+
+def average_hold_minutes(hold_minutes: list[float]) -> float | None:
+    if not hold_minutes:
+        return None
+    return sum(hold_minutes) / len(hold_minutes)
 
 
 def simulated_trade(
