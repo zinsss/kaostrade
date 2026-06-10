@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from statistics import mean, pstdev
+from statistics import mean, median, pstdev
 from typing import Any
 
 from rich.console import Console
@@ -482,12 +482,14 @@ def print_walk_forward(conn: sqlite3.Connection, args: argparse.Namespace, marke
     returns = [float(summary["return_pct"]) for summary in summaries]
     summary_table = Table(title="Walk-Forward Summary")
     summary_table.add_column("average_return_pct", justify="right")
+    summary_table.add_column("median_return_pct", justify="right")
     summary_table.add_column("positive_window_count", justify="right")
     summary_table.add_column("negative_window_count", justify="right")
     summary_table.add_column("worst_window_return_pct", justify="right")
     summary_table.add_column("best_window_return_pct", justify="right")
     summary_table.add_row(
         format_float(sum(returns) / len(returns)) if returns else "-",
+        format_float(median(returns)) if returns else "-",
         str(sum(1 for value in returns if value > 0)),
         str(sum(1 for value in returns if value < 0)),
         format_float(min(returns)) if returns else "-",
