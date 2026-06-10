@@ -6,6 +6,10 @@ Classifier = Callable[[Any], tuple[str, str]]
 CLASSIFIER_NAMES = ("basic", "momentum", "breadth")
 
 
+class ClassifierNotApplicable(ValueError):
+    pass
+
+
 def classify_basic(features: Any) -> tuple[str, str]:
     btc_return_1h = features["btc_return_1h"]
     median_return_1h = features["median_return_1h"]
@@ -46,6 +50,8 @@ def classify_momentum(features: Any) -> tuple[str, str]:
     btc_return_1h = features["btc_return_1h"]
     btc_return_4h = _feature_value(features, "btc_return_4h")
     median_return_1h = features["median_return_1h"]
+    if btc_return_1h is None or btc_return_4h is None or median_return_1h is None:
+        raise ClassifierNotApplicable("momentum classifier requires btc_return_1h, btc_return_4h, and median_return_1h")
 
     if _gt(btc_return_1h, 0) and _gt(btc_return_4h, 0) and _gt(median_return_1h, 0):
         return "RISK_ON", "BTC 1h, BTC 4h, and median 1h returns are positive."

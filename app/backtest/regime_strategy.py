@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.table import Table
 
 from app.collector.collect_once import CONFIG_PATH, DEFAULT_DB_PATH, load_config
-from app.regime.classifiers import CLASSIFIER_NAMES, get_classifier
+from app.regime.classifiers import CLASSIFIER_NAMES, ClassifierNotApplicable, get_classifier
 
 START_CASH_KRW = 1_000_000.0
 DEFAULT_ENTRY_STREAK = 3
@@ -126,6 +126,8 @@ def print_classifier_comparison(conn: sqlite3.Connection, args: argparse.Namespa
     table = Table(title="Regime Classifier Comparison")
     table.add_column("classifier")
     table.add_column("trade_count", justify="right")
+    table.add_column("usable_feature_count", justify="right")
+    table.add_column("skipped_feature_count", justify="right")
     table.add_column("return_pct", justify="right")
     table.add_column("total_fees_krw", justify="right")
     table.add_column("average_hold_minutes", justify="right")
@@ -146,6 +148,8 @@ def print_classifier_comparison(conn: sqlite3.Connection, args: argparse.Namespa
         table.add_row(
             classifier_name,
             str(summary["trade_count"]),
+            str(summary["usable_feature_count"]),
+            str(summary["skipped_feature_count"]),
             format_float(summary["return_pct"]),
             format_float(summary["total_fees_krw"]),
             format_optional_float(summary["average_hold_minutes"]),
@@ -227,7 +231,8 @@ def run_backtest(conn: sqlite3.Connection, settings: BacktestSettings | None = N
     risk_on_streak = 0
     risk_off_streak = 0
 
-    regimes = load_classified_regimes(conn, settings)
+    classification = load_classified_regimes(conn, settings)
+    regimes = classification["regimes"]
     for regime_row in regimes:
         ts = str(regime_row["ts"])
         regime = str(regime_row["regime"])
@@ -338,6 +343,8 @@ def run_backtest(conn: sqlite3.Connection, settings: BacktestSettings | None = N
         "longest_hold_minutes": max(hold_minutes) if hold_minutes else None,
         "shortest_hold_minutes": min(hold_minutes) if hold_minutes else None,
         "regime_counts": regime_counts,
+        "usable_feature_count": classification["usable_feature_count"],
+        "skipped_feature_count": classification["skipped_feature_count"],
         "max_drawdown_pct": max_drawdown_pct(equity_curve),
         "positions": serialize_positions(positions, latest_prices),
         "latest_equity_point": latest_equity_point,
@@ -420,11 +427,16 @@ def parse_utc_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def load_classified_regimes(conn: sqlite3.Connection, settings: BacktestSettings) -> list[dict[str, Any]]:
+def load_classified_regimes(conn: sqlite3.Connection, settings: BacktestSettings) -> dict[str, Any]:
     classifier = get_classifier(settings.regime_classifier)
     regimes = []
+    skipped_feature_count = 0
     for feature_row in load_market_features(conn, settings.source):
-        regime, reason = classifier(feature_row)
+        try:
+            regime, reason = classifier(feature_row)
+        except ClassifierNotApplicable:
+            skipped_feature_count += 1
+            continue
         regimes.append(
             {
                 "id": feature_row["id"],
@@ -433,7 +445,11 @@ def load_classified_regimes(conn: sqlite3.Connection, settings: BacktestSettings
                 "reason": reason,
             }
         )
-    return regimes
+    return {
+        "regimes": regimes,
+        "usable_feature_count": len(regimes),
+        "skipped_feature_count": skipped_feature_count,
+    }
 
 
 def load_market_features(conn: sqlite3.Connection, source: str = DEFAULT_SOURCE) -> list[sqlite3.Row]:

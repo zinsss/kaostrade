@@ -81,6 +81,9 @@ def backfill_features_and_regimes(
         "regimes_inserted": 0,
         "regimes_existing": 0,
         "features_updated": 0,
+        "features_with_1h_count": 0,
+        "features_with_4h_count": 0,
+        "features_missing_4h_count": 0,
         "skipped_count": 0,
         "first_ts": timestamps[0] if timestamps else None,
         "last_ts": timestamps[-1] if timestamps else None,
@@ -137,7 +140,27 @@ def backfill_features_and_regimes(
         conn.commit()
         summary["regimes_inserted"] += 1
 
+    summary.update(feature_coverage_counts(conn, BACKFILL_SOURCE))
     return summary
+
+
+def feature_coverage_counts(conn: sqlite3.Connection, source: str) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN btc_return_1h IS NOT NULL OR eth_return_1h IS NOT NULL OR median_return_1h IS NOT NULL THEN 1 ELSE 0 END) AS features_with_1h_count,
+            SUM(CASE WHEN btc_return_4h IS NOT NULL OR eth_return_4h IS NOT NULL OR median_return_4h IS NOT NULL THEN 1 ELSE 0 END) AS features_with_4h_count,
+            SUM(CASE WHEN btc_return_4h IS NULL AND eth_return_4h IS NULL AND median_return_4h IS NULL THEN 1 ELSE 0 END) AS features_missing_4h_count
+        FROM market_features
+        WHERE source = ?
+        """,
+        (source,),
+    ).fetchone()
+    return {
+        "features_with_1h_count": int(row["features_with_1h_count"] or 0),
+        "features_with_4h_count": int(row["features_with_4h_count"] or 0),
+        "features_missing_4h_count": int(row["features_missing_4h_count"] or 0),
+    }
 
 
 def latest_candle_time(conn: sqlite3.Connection, markets: list[str]) -> datetime | None:
@@ -353,6 +376,9 @@ def empty_summary(markets: list[str], days: int, step_minutes: int, reason: str)
         "regimes_inserted": 0,
         "regimes_existing": 0,
         "features_updated": 0,
+        "features_with_1h_count": 0,
+        "features_with_4h_count": 0,
+        "features_missing_4h_count": 0,
         "skipped_count": 0,
         "first_ts": None,
         "last_ts": None,
