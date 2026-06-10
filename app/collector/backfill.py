@@ -23,7 +23,7 @@ def main() -> None:
     with connect(db_path) as conn:
         init_schema(conn)
         with BithumbPublicClient() as bithumb:
-            markets = resolve_markets(bithumb, args)
+            markets = resolve_markets(bithumb, args, config)
             collected_at = datetime.now(timezone.utc).isoformat()
             upsert_markets(conn, markets, collected_at)
             conn.commit()
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backfill Bithumb public candles into SQLite.")
     market_group = parser.add_mutually_exclusive_group(required=True)
     market_group.add_argument("--market", action="append", dest="markets")
-    market_group.add_argument("--all-markets", action="store_true")
+    market_group.add_argument("--all-markets", action="store_true", help="Backfill all configured whitelist markets")
     parser.add_argument("--interval", choices=SUPPORTED_INTERVALS, required=True)
     parser.add_argument("--days", type=positive_int, required=True)
     parser.add_argument("--sleep-seconds", type=non_negative_float, default=REQUEST_SLEEP_SECONDS)
@@ -86,15 +86,18 @@ def non_negative_float(value: str) -> float:
     return parsed
 
 
-def resolve_markets(bithumb: BithumbPublicClient, args: argparse.Namespace) -> list[dict[str, Any]]:
+def resolve_markets(
+    bithumb: BithumbPublicClient,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
     krw_markets = [market for market in bithumb.get_markets() if market.get("market", "").startswith("KRW-")]
     by_symbol = {market["market"]: market for market in krw_markets}
-    if args.all_markets:
-        return sorted(krw_markets, key=lambda market: market["market"])
+    symbols = configured_markets(config) if args.all_markets else args.markets or []
 
     selected = []
     missing = []
-    for symbol in args.markets or []:
+    for symbol in symbols:
         market = by_symbol.get(symbol)
         if market is None:
             missing.append(symbol)
@@ -103,6 +106,20 @@ def resolve_markets(bithumb: BithumbPublicClient, args: argparse.Namespace) -> l
     if missing:
         raise ValueError("Unknown or non-KRW market(s): " + ", ".join(missing))
     return selected
+
+
+def configured_markets(config: dict[str, Any]) -> list[str]:
+    symbols = config.get("collector", {}).get("static_whitelist", [])
+    if not symbols:
+        raise ValueError("collector.static_whitelist is empty; no configured markets to backfill")
+
+    unique_symbols = []
+    seen = set()
+    for symbol in symbols:
+        if symbol not in seen:
+            unique_symbols.append(symbol)
+            seen.add(symbol)
+    return unique_symbols
 
 
 def backfill_market(
