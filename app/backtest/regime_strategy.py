@@ -8,13 +8,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from rich.console import Console
+from rich.table import Table
+
 from app.collector.collect_once import CONFIG_PATH, DEFAULT_DB_PATH, load_config
 
 START_CASH_KRW = 1_000_000.0
-TRADE_NOTIONAL_KRW = 10_000.0
-FEE_RATE = 0.0005
-MAX_PRICE_DISTANCE_SECONDS = 300
+DEFAULT_ENTRY_STREAK = 3
+DEFAULT_EXIT_STREAK = 3
+DEFAULT_TRADE_NOTIONAL_KRW = 10_000.0
+DEFAULT_FEE_RATE = 0.0005
+DEFAULT_MAX_PRICE_DISTANCE_SECONDS = 300
 MARKETS = ("KRW-BTC", "KRW-ETH")
+
+
+@dataclass
+class BacktestSettings:
+    mode: str = "persistent"
+    entry_streak: int = DEFAULT_ENTRY_STREAK
+    exit_streak: int = DEFAULT_EXIT_STREAK
+    trade_notional_krw: float = DEFAULT_TRADE_NOTIONAL_KRW
+    fee_rate: float = DEFAULT_FEE_RATE
+    max_price_distance_seconds: int = DEFAULT_MAX_PRICE_DISTANCE_SECONDS
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "entry_streak": self.entry_streak,
+            "exit_streak": self.exit_streak,
+            "trade_notional_krw": self.trade_notional_krw,
+            "fee_rate": self.fee_rate,
+            "max_price_distance_seconds": self.max_price_distance_seconds,
+        }
 
 
 @dataclass
@@ -30,7 +55,10 @@ def main() -> None:
     db_path = config.get("database", {}).get("path", DEFAULT_DB_PATH)
 
     with connect_read_only(db_path) as conn:
-        summary = run_backtest(conn, mode=args.mode)
+        if args.compare:
+            print_comparison(conn, args)
+            return
+        summary = run_backtest(conn, settings_from_args(args))
 
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -38,7 +66,90 @@ def main() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest the regime strategy.")
     parser.add_argument("--mode", choices=("simple", "persistent"), default="persistent")
+    parser.add_argument("--entry-streak", type=positive_int, default=DEFAULT_ENTRY_STREAK)
+    parser.add_argument("--exit-streak", type=positive_int, default=DEFAULT_EXIT_STREAK)
+    parser.add_argument("--trade-notional-krw", type=positive_float, default=DEFAULT_TRADE_NOTIONAL_KRW)
+    parser.add_argument("--fee-rate", type=non_negative_float, default=DEFAULT_FEE_RATE)
+    parser.add_argument("--max-price-distance-seconds", type=positive_int, default=DEFAULT_MAX_PRICE_DISTANCE_SECONDS)
+    parser.add_argument("--compare", action="store_true")
     return parser.parse_args()
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
+def settings_from_args(args: argparse.Namespace) -> BacktestSettings:
+    return BacktestSettings(
+        mode=args.mode,
+        entry_streak=args.entry_streak,
+        exit_streak=args.exit_streak,
+        trade_notional_krw=args.trade_notional_krw,
+        fee_rate=args.fee_rate,
+        max_price_distance_seconds=args.max_price_distance_seconds,
+    )
+
+
+def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    table = Table(title="Regime Backtest Comparison")
+    table.add_column("mode")
+    table.add_column("entry_streak", justify="right")
+    table.add_column("exit_streak", justify="right")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for streak in (3, 5, 7):
+        settings = BacktestSettings(
+            mode="persistent",
+            entry_streak=streak,
+            exit_streak=streak,
+            trade_notional_krw=args.trade_notional_krw,
+            fee_rate=args.fee_rate,
+            max_price_distance_seconds=args.max_price_distance_seconds,
+        )
+        summary = run_backtest(conn, settings)
+        table.add_row(
+            settings.mode,
+            str(settings.entry_streak),
+            str(settings.exit_streak),
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_optional_float(summary["average_hold_minutes"]),
+            format_float(summary["max_drawdown_pct"]),
+        )
+
+    Console(width=140).print(table)
+
+
+def format_float(value: float) -> str:
+    return f"{value:,.6f}"
+
+
+def format_optional_float(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return format_float(value)
 
 
 def connect_read_only(db_path: str) -> sqlite3.Connection:
@@ -49,7 +160,9 @@ def connect_read_only(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str, Any]:
+def run_backtest(conn: sqlite3.Connection, settings: BacktestSettings | None = None, mode: str | None = None) -> dict[str, Any]:
+    if settings is None:
+        settings = BacktestSettings(mode=mode or "persistent")
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
     buy_count = 0
@@ -71,8 +184,8 @@ def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str
         if regime in regime_counts:
             regime_counts[regime] += 1
         risk_on_streak, risk_off_streak = update_regime_streaks(regime, risk_on_streak, risk_off_streak)
-        action_regime = action_regime_for_mode(mode, regime, risk_on_streak, risk_off_streak)
-        price_result = prices_near_timestamp(conn, ts, MARKETS)
+        action_regime = action_regime_for_mode(settings, regime, risk_on_streak, risk_off_streak)
+        price_result = prices_near_timestamp(conn, ts, MARKETS, settings)
         prices = price_result["prices"]
         skipped.extend(f"{ts}: {reason}" for reason in price_result["skipped"])
         missing_prices = [market for market in MARKETS if market not in prices]
@@ -86,12 +199,12 @@ def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str
                 price = prices.get(market)
                 if price is None:
                     continue
-                total_cost = TRADE_NOTIONAL_KRW * (1 + FEE_RATE)
+                total_cost = settings.trade_notional_krw * (1 + settings.fee_rate)
                 if cash < total_cost:
                     skipped.append(f"{ts}: insufficient cash to buy {market}")
                     continue
-                quantity = TRADE_NOTIONAL_KRW / price
-                fee_krw = TRADE_NOTIONAL_KRW * FEE_RATE
+                quantity = settings.trade_notional_krw / price
+                fee_krw = settings.trade_notional_krw * settings.fee_rate
                 cash -= total_cost
                 positions[market] = Position(quantity=quantity, average_entry_price=price, entry_ts=ts)
                 total_fees_krw += fee_krw
@@ -103,7 +216,7 @@ def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str
                         market=market,
                         price=price,
                         quantity=quantity,
-                        notional_krw=TRADE_NOTIONAL_KRW,
+                        notional_krw=settings.trade_notional_krw,
                         fee_krw=fee_krw,
                     )
                 )
@@ -114,7 +227,7 @@ def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str
                     continue
                 position = positions.pop(market)
                 notional = position.quantity * price
-                fee_krw = notional * FEE_RATE
+                fee_krw = notional * settings.fee_rate
                 cash += notional - fee_krw
                 realized_pnl_krw += notional - fee_krw - (position.quantity * position.average_entry_price)
                 hold_minutes.append(position_hold_minutes(position, ts))
@@ -145,7 +258,7 @@ def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str
             }
         )
 
-    latest_prices = latest_prices_for_positions(conn, positions)
+    latest_prices = latest_prices_for_positions(conn, positions, settings)
     final_equity = estimate_equity(cash, positions, latest_prices)
     unrealized_pnl_krw = unrealized_pnl(positions, latest_prices)
     first_ts = str(regimes[0]["ts"]) if regimes else None
@@ -157,7 +270,8 @@ def run_backtest(conn: sqlite3.Connection, mode: str = "persistent") -> dict[str
         latest_equity_point["cash"] = cash
 
     return {
-        "mode": mode,
+        "parameters": settings.to_json(),
+        "mode": settings.mode,
         "start_cash": START_CASH_KRW,
         "final_equity": final_equity,
         "return_pct": (final_equity - START_CASH_KRW) / START_CASH_KRW * 100,
@@ -191,14 +305,14 @@ def update_regime_streaks(regime: str, risk_on_streak: int, risk_off_streak: int
     return 0, 0
 
 
-def action_regime_for_mode(mode: str, regime: str, risk_on_streak: int, risk_off_streak: int) -> str:
-    if mode == "simple":
+def action_regime_for_mode(settings: BacktestSettings, regime: str, risk_on_streak: int, risk_off_streak: int) -> str:
+    if settings.mode == "simple":
         return regime
-    if mode != "persistent":
-        raise ValueError(f"Unsupported backtest mode: {mode}")
-    if regime == "RISK_ON" and risk_on_streak >= 3:
+    if settings.mode != "persistent":
+        raise ValueError(f"Unsupported backtest mode: {settings.mode}")
+    if regime == "RISK_ON" and risk_on_streak >= settings.entry_streak:
         return "RISK_ON"
-    if regime == "RISK_OFF" and risk_off_streak >= 3:
+    if regime == "RISK_OFF" and risk_off_streak >= settings.exit_streak:
         return "RISK_OFF"
     return "NEUTRAL"
 
@@ -266,30 +380,40 @@ def load_regimes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def prices_near_timestamp(conn: sqlite3.Connection, ts: str, markets: tuple[str, ...]) -> dict[str, Any]:
+def prices_near_timestamp(
+    conn: sqlite3.Connection,
+    ts: str,
+    markets: tuple[str, ...],
+    settings: BacktestSettings,
+) -> dict[str, Any]:
     prices = {}
     skipped = []
     for market in markets:
-        candle = candle_price_near_timestamp(conn, market, ts)
+        candle = candle_price_near_timestamp(conn, market, ts, settings)
         if candle is not None:
             prices[market] = candle["price"]
             continue
 
-        ticker = ticker_price_near_timestamp(conn, market, ts)
+        ticker = ticker_price_near_timestamp(conn, market, ts, settings)
         if ticker is not None:
             prices[market] = ticker["price"]
             continue
 
         nearest = nearest_price_distance(conn, market, ts)
-        if nearest is not None and nearest > MAX_PRICE_DISTANCE_SECONDS:
+        if nearest is not None and nearest > settings.max_price_distance_seconds:
             skipped.append(
                 f"price too far from timestamp for {market}: distance_seconds={nearest} "
-                f"max_distance_seconds={MAX_PRICE_DISTANCE_SECONDS}"
+                f"max_distance_seconds={settings.max_price_distance_seconds}"
             )
     return {"prices": prices, "skipped": skipped}
 
 
-def candle_price_near_timestamp(conn: sqlite3.Connection, market: str, ts: str) -> dict[str, float] | None:
+def candle_price_near_timestamp(
+    conn: sqlite3.Connection,
+    market: str,
+    ts: str,
+    settings: BacktestSettings,
+) -> dict[str, float] | None:
     row = conn.execute(
         """
         SELECT
@@ -304,10 +428,15 @@ def candle_price_near_timestamp(conn: sqlite3.Connection, market: str, ts: str) 
         """,
         (ts, market),
     ).fetchone()
-    return price_candidate(row)
+    return price_candidate(row, settings)
 
 
-def ticker_price_near_timestamp(conn: sqlite3.Connection, market: str, ts: str) -> dict[str, float] | None:
+def ticker_price_near_timestamp(
+    conn: sqlite3.Connection,
+    market: str,
+    ts: str,
+    settings: BacktestSettings,
+) -> dict[str, float] | None:
     row = conn.execute(
         """
         SELECT
@@ -321,14 +450,14 @@ def ticker_price_near_timestamp(conn: sqlite3.Connection, market: str, ts: str) 
         """,
         (ts, market),
     ).fetchone()
-    return price_candidate(row)
+    return price_candidate(row, settings)
 
 
-def price_candidate(row: sqlite3.Row | None) -> dict[str, float] | None:
+def price_candidate(row: sqlite3.Row | None, settings: BacktestSettings) -> dict[str, float] | None:
     if row is None:
         return None
     distance_seconds = int(row["distance_seconds"])
-    if distance_seconds > MAX_PRICE_DISTANCE_SECONDS:
+    if distance_seconds > settings.max_price_distance_seconds:
         return None
     return {"price": float(row["trade_price"]), "distance_seconds": float(distance_seconds)}
 
@@ -354,17 +483,21 @@ def nearest_price_distance(conn: sqlite3.Connection, market: str, ts: str) -> in
     return int(row["distance_seconds"])
 
 
-def latest_prices_for_positions(conn: sqlite3.Connection, positions: dict[str, Position]) -> dict[str, float]:
+def latest_prices_for_positions(
+    conn: sqlite3.Connection,
+    positions: dict[str, Position],
+    settings: BacktestSettings,
+) -> dict[str, float]:
     if not positions:
         return {}
     prices = {}
     now = datetime.now(timezone.utc).isoformat()
     for market in positions:
-        candle = candle_price_near_timestamp(conn, market, now)
+        candle = candle_price_near_timestamp(conn, market, now, settings)
         if candle is not None:
             prices[market] = candle["price"]
             continue
-        ticker = ticker_price_near_timestamp(conn, market, now)
+        ticker = ticker_price_near_timestamp(conn, market, now, settings)
         if ticker is not None:
             prices[market] = ticker["price"]
     return prices
