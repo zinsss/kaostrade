@@ -78,6 +78,7 @@ ON candles (market, interval, candle_date_time_utc);
 CREATE TABLE IF NOT EXISTS market_features (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'live',
     btc_return_1h REAL,
     eth_return_1h REAL,
     median_return_1h REAL,
@@ -93,6 +94,7 @@ ON market_features (ts);
 CREATE TABLE IF NOT EXISTS market_regimes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'live',
     regime TEXT NOT NULL,
     reason TEXT NOT NULL,
     market_features_id INTEGER,

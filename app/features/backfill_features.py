@@ -19,6 +19,7 @@ CONFIG_PATH = Path("/app/config.yaml")
 DEFAULT_DB_PATH = "/app/data/kaostrade.sqlite"
 DEFAULT_STEP_MINUTES = 5
 DEFAULT_TOLERANCE_MINUTES = 5
+BACKFILL_SOURCE = "backfill"
 
 
 def main() -> None:
@@ -85,7 +86,7 @@ def backfill_features_and_regimes(
     }
 
     for ts in timestamps:
-        existing_feature = market_feature_by_ts(conn, ts)
+        existing_feature = market_feature_by_ts(conn, ts, BACKFILL_SOURCE)
         if existing_feature is None:
             features = historical_features(conn, markets, ts, tolerance_minutes)
             if features is None:
@@ -99,13 +100,14 @@ def backfill_features_and_regimes(
             features = dict(existing_feature)
             summary["features_existing"] += 1
 
-        if market_regime_by_ts(conn, ts) is not None:
+        if market_regime_by_ts(conn, ts, BACKFILL_SOURCE) is not None:
             summary["regimes_existing"] += 1
             continue
 
         regime, reason = classify_features(features)
         regime_row = {
             "ts": ts,
+            "source": BACKFILL_SOURCE,
             "regime": regime,
             "reason": reason,
             "market_features_id": features["id"],
@@ -180,6 +182,7 @@ def historical_features(
 
     return {
         "ts": ts,
+        "source": BACKFILL_SOURCE,
         "btc_return_1h": returns_by_market.get("KRW-BTC"),
         "eth_return_1h": returns_by_market.get("KRW-ETH"),
         "median_return_1h": median(returns),
@@ -256,12 +259,13 @@ def closest_candle_price(
     return float(closest["trade_price"])
 
 
-def market_feature_by_ts(conn: sqlite3.Connection, ts: str) -> sqlite3.Row | None:
+def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT
             id,
             ts,
+            source,
             btc_return_1h,
             eth_return_1h,
             median_return_1h,
@@ -270,24 +274,24 @@ def market_feature_by_ts(conn: sqlite3.Connection, ts: str) -> sqlite3.Row | Non
             average_imbalance_5,
             market_count
         FROM market_features
-        WHERE ts = ?
+        WHERE ts = ? AND source = ?
         ORDER BY id ASC
         LIMIT 1
         """,
-        (ts,),
+        (ts, source),
     ).fetchone()
 
 
-def market_regime_by_ts(conn: sqlite3.Connection, ts: str) -> sqlite3.Row | None:
+def market_regime_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT id
         FROM market_regimes
-        WHERE ts = ?
+        WHERE ts = ? AND source = ?
         ORDER BY id ASC
         LIMIT 1
         """,
-        (ts,),
+        (ts, source),
     ).fetchone()
 
 
