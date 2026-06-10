@@ -33,6 +33,7 @@ STRATEGIES = (
     "donchian",
     "bollinger_rsi_and",
     "bollinger_rsi_or",
+    "bollinger_rsi_and_mtf",
 )
 EMA_FAST = 20
 EMA_SLOW = 50
@@ -581,6 +582,8 @@ def run_backtest(
     window_start: datetime | None = None,
     window_end: datetime | None = None,
 ) -> dict[str, Any]:
+    validate_strategy_interval(strategy, interval)
+
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
     buy_count = 0
@@ -754,6 +757,11 @@ def load_candles(
     return candles
 
 
+def validate_strategy_interval(strategy: str, interval: str) -> None:
+    if strategy == "bollinger_rsi_and_mtf" and interval != "1m":
+        raise ValueError("bollinger_rsi_and_mtf requires --interval 1m")
+
+
 def strategy_signals(
     strategy: str,
     candles: list[Candle],
@@ -789,6 +797,14 @@ def strategy_signals(
             rsi_buy_threshold=rsi_buy_threshold,
             rsi_sell_threshold=rsi_sell_threshold,
             buy_mode="or",
+        )
+    if strategy == "bollinger_rsi_and_mtf":
+        return bollinger_rsi_mtf_signals(
+            candles,
+            period=bollinger_period,
+            stddev=bollinger_stddev,
+            rsi_buy_threshold=rsi_buy_threshold,
+            rsi_sell_threshold=rsi_sell_threshold,
         )
     raise ValueError(f"Unsupported strategy: {strategy}")
 
@@ -866,6 +882,84 @@ def bollinger_rsi_signals(
         elif bollinger_sell or rsi_sell:
             signals.append(signal_event(candles[index], "SELL"))
     return signals
+
+
+def bollinger_rsi_mtf_signals(
+    candles: list[Candle],
+    period: int,
+    stddev: float,
+    rsi_buy_threshold: float,
+    rsi_sell_threshold: float,
+) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    rsi = rsi_series(prices, RSI_PERIOD)
+    mtf_trend = aligned_mtf_trend(candles)
+    signals = []
+    for index in range(period, len(candles)):
+        previous_window = prices[index - period:index]
+        current_window = prices[index - period + 1:index + 1]
+        previous_middle = mean(previous_window)
+        previous_lower = previous_middle - stddev * pstdev(previous_window)
+        current_middle = mean(current_window)
+        current_lower = current_middle - stddev * pstdev(current_window)
+        previous_price = prices[index - 1]
+        current_price = prices[index]
+        current_rsi = rsi[index]
+        if current_rsi is None:
+            continue
+
+        bollinger_buy = previous_price <= previous_lower and current_price > current_lower
+        bollinger_sell = previous_price >= previous_middle and current_price < current_middle
+        rsi_buy = current_rsi < rsi_buy_threshold
+        rsi_sell = current_rsi > rsi_sell_threshold
+        buy_signal = bollinger_buy and rsi_buy and mtf_trend.get(candles[index].ts, False)
+        if buy_signal:
+            signals.append(signal_event(candles[index], "BUY"))
+        elif bollinger_sell or rsi_sell:
+            signals.append(signal_event(candles[index], "SELL"))
+    return signals
+
+
+def aligned_mtf_trend(candles: list[Candle]) -> dict[str, bool]:
+    five_minute_candles = derive_five_minute_candles(candles)
+    if not five_minute_candles:
+        return {}
+
+    prices = [candle.price for candle in five_minute_candles]
+    ema_fast = ema_series(prices, EMA_FAST)
+    ema_slow = ema_series(prices, EMA_SLOW)
+    states = []
+    for index, candle in enumerate(five_minute_candles):
+        current_fast = ema_fast[index]
+        current_slow = ema_slow[index]
+        if None in (current_fast, current_slow):
+            continue
+        states.append((parse_utc_datetime(candle.ts), current_fast > current_slow))
+
+    aligned = {}
+    state_index = 0
+    latest_state: bool | None = None
+    for candle in candles:
+        candle_ts = parse_utc_datetime(candle.ts)
+        while state_index < len(states) and states[state_index][0] <= candle_ts:
+            latest_state = states[state_index][1]
+            state_index += 1
+        if latest_state is not None:
+            aligned[candle.ts] = latest_state
+    return aligned
+
+
+def derive_five_minute_candles(candles: list[Candle]) -> list[Candle]:
+    grouped: dict[datetime, Candle] = {}
+    for candle in candles:
+        bucket_ts = floor_to_five_minutes(parse_utc_datetime(candle.ts))
+        grouped[bucket_ts] = candle
+    return [grouped[bucket_ts] for bucket_ts in sorted(grouped)]
+
+
+def floor_to_five_minutes(value: datetime) -> datetime:
+    value = value.astimezone(timezone.utc)
+    return value.replace(minute=value.minute - (value.minute % 5), second=0, microsecond=0)
 
 
 def ema_rsi_signals(candles: list[Candle]) -> list[dict[str, Any]]:
