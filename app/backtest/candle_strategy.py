@@ -63,6 +63,9 @@ def main() -> None:
         if args.compare_risk:
             print_risk_comparison(conn, args, markets)
             return
+        if args.breakdown_by_market:
+            print_market_breakdown(conn, args, markets)
+            return
         summary = run_backtest(
             conn=conn,
             strategy=args.strategy,
@@ -99,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--compare-bollinger", action="store_true")
     parser.add_argument("--compare-risk", action="store_true")
+    parser.add_argument("--breakdown-by-market", action="store_true")
     return parser.parse_args()
 
 
@@ -285,6 +289,53 @@ def print_risk_comparison(conn: sqlite3.Connection, args: argparse.Namespace, ma
         table.add_row(
             format_float(summary["take_profit_pct"]),
             format_float(summary["stop_loss_pct"]),
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_optional_float(summary["average_hold_minutes"]),
+            format_float(summary["max_drawdown_pct"]),
+            str(summary["take_profit_count"]),
+            str(summary["stop_loss_count"]),
+        )
+
+    Console(width=140).print(table)
+
+
+def print_market_breakdown(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    summaries = []
+    for market in markets:
+        summary = run_backtest(
+            conn=conn,
+            strategy=args.strategy,
+            markets=[market],
+            days=args.days,
+            interval=args.interval,
+            trade_notional_krw=args.trade_notional_krw,
+            fee_rate=args.fee_rate,
+            min_signal_gap_minutes=args.min_signal_gap_minutes,
+            bollinger_period=args.bollinger_period,
+            bollinger_stddev=args.bollinger_stddev,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+        )
+        summaries.append(summary)
+
+    summaries.sort(key=lambda summary: summary["return_pct"], reverse=True)
+
+    table = Table(title="Per-Market Backtest Breakdown")
+    table.add_column("market")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("take_profit_count", justify="right")
+    table.add_column("stop_loss_count", justify="right")
+
+    for summary in summaries:
+        market = summary["markets"][0] if summary["markets"] else "-"
+        table.add_row(
+            market,
             str(summary["trade_count"]),
             format_float(summary["return_pct"]),
             format_float(summary["total_fees_krw"]),
