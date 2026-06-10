@@ -23,8 +23,10 @@ DEFAULT_MIN_SIGNAL_GAP_MINUTES = 0
 STRATEGIES = ("ema", "bollinger")
 EMA_FAST = 20
 EMA_SLOW = 50
-BOLLINGER_PERIOD = 20
-BOLLINGER_STDDEV = 2.0
+DEFAULT_BOLLINGER_PERIOD = 20
+DEFAULT_BOLLINGER_STDDEV = 2.0
+BOLLINGER_SWEEP_PERIODS = (10, 20, 30)
+BOLLINGER_SWEEP_STDDEVS = (1.5, 2.0, 2.5, 3.0)
 
 
 @dataclass
@@ -51,6 +53,9 @@ def main() -> None:
         if args.compare:
             print_comparison(conn, args, markets)
             return
+        if args.compare_bollinger:
+            print_bollinger_comparison(conn, args, markets)
+            return
         summary = run_backtest(
             conn=conn,
             strategy=args.strategy,
@@ -60,6 +65,8 @@ def main() -> None:
             trade_notional_krw=args.trade_notional_krw,
             fee_rate=args.fee_rate,
             min_signal_gap_minutes=args.min_signal_gap_minutes,
+            bollinger_period=args.bollinger_period,
+            bollinger_stddev=args.bollinger_stddev,
         )
 
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
@@ -76,7 +83,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-notional-krw", type=positive_float, default=DEFAULT_TRADE_NOTIONAL_KRW)
     parser.add_argument("--fee-rate", type=non_negative_float, default=DEFAULT_FEE_RATE)
     parser.add_argument("--min-signal-gap-minutes", type=non_negative_int, default=DEFAULT_MIN_SIGNAL_GAP_MINUTES)
+    parser.add_argument("--bollinger-period", type=positive_int, default=DEFAULT_BOLLINGER_PERIOD)
+    parser.add_argument("--bollinger-stddev", type=positive_float, default=DEFAULT_BOLLINGER_STDDEV)
     parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--compare-bollinger", action="store_true")
     return parser.parse_args()
 
 
@@ -162,12 +172,57 @@ def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets
             trade_notional_krw=args.trade_notional_krw,
             fee_rate=args.fee_rate,
             min_signal_gap_minutes=args.min_signal_gap_minutes,
+            bollinger_period=args.bollinger_period,
+            bollinger_stddev=args.bollinger_stddev,
         )
         table.add_row(
             strategy,
             str(summary["trade_count"]),
             str(summary["raw_signal_count"]),
             str(summary["accepted_signal_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_optional_float(summary["average_hold_minutes"]),
+            format_float(summary["max_drawdown_pct"]),
+        )
+
+    Console(width=120).print(table)
+
+
+def print_bollinger_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    summaries = []
+    for period in BOLLINGER_SWEEP_PERIODS:
+        for stddev in BOLLINGER_SWEEP_STDDEVS:
+            summary = run_backtest(
+                conn=conn,
+                strategy="bollinger",
+                markets=markets,
+                days=args.days,
+                interval=args.interval,
+                trade_notional_krw=args.trade_notional_krw,
+                fee_rate=args.fee_rate,
+                min_signal_gap_minutes=args.min_signal_gap_minutes,
+                bollinger_period=period,
+                bollinger_stddev=stddev,
+            )
+            summaries.append(summary)
+
+    summaries.sort(key=lambda summary: summary["return_pct"], reverse=True)
+
+    table = Table(title="Bollinger Parameter Sweep")
+    table.add_column("period", justify="right")
+    table.add_column("stddev", justify="right")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for summary in summaries:
+        table.add_row(
+            str(summary["bollinger_period"]),
+            format_float(summary["bollinger_stddev"]),
+            str(summary["trade_count"]),
             format_float(summary["return_pct"]),
             format_float(summary["total_fees_krw"]),
             format_optional_float(summary["average_hold_minutes"]),
@@ -186,6 +241,8 @@ def run_backtest(
     trade_notional_krw: float,
     fee_rate: float,
     min_signal_gap_minutes: int,
+    bollinger_period: int,
+    bollinger_stddev: float,
 ) -> dict[str, Any]:
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
@@ -199,7 +256,12 @@ def run_backtest(
     latest_prices: dict[str, float] = {}
 
     signals_by_market = {
-        market: strategy_signals(strategy, load_candles(conn, market, interval, days))
+        market: strategy_signals(
+            strategy,
+            load_candles(conn, market, interval, days),
+            bollinger_period=bollinger_period,
+            bollinger_stddev=bollinger_stddev,
+        )
         for market in markets
     }
     raw_signal_count = sum(len(signals) for signals in signals_by_market.values())
@@ -257,6 +319,8 @@ def run_backtest(
         "strategy": strategy,
         "markets": markets,
         "min_signal_gap_minutes": min_signal_gap_minutes,
+        "bollinger_period": bollinger_period if strategy == "bollinger" else None,
+        "bollinger_stddev": bollinger_stddev if strategy == "bollinger" else None,
         "raw_signal_count": raw_signal_count,
         "accepted_signal_count": accepted_signal_count,
         "skipped_signal_count": raw_signal_count - accepted_signal_count,
@@ -300,11 +364,16 @@ def load_candles(conn: sqlite3.Connection, market: str, interval: str, days: int
     return candles
 
 
-def strategy_signals(strategy: str, candles: list[Candle]) -> list[dict[str, Any]]:
+def strategy_signals(
+    strategy: str,
+    candles: list[Candle],
+    bollinger_period: int,
+    bollinger_stddev: float,
+) -> list[dict[str, Any]]:
     if strategy == "ema":
         return ema_signals(candles)
     if strategy == "bollinger":
-        return bollinger_signals(candles)
+        return bollinger_signals(candles, period=bollinger_period, stddev=bollinger_stddev)
     raise ValueError(f"Unsupported strategy: {strategy}")
 
 
@@ -343,16 +412,16 @@ def ema_series(values: list[float], period: int) -> list[float | None]:
     return series
 
 
-def bollinger_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+def bollinger_signals(candles: list[Candle], period: int, stddev: float) -> list[dict[str, Any]]:
     prices = [candle.price for candle in candles]
     signals = []
-    for index in range(BOLLINGER_PERIOD, len(candles)):
-        previous_window = prices[index - BOLLINGER_PERIOD:index]
-        current_window = prices[index - BOLLINGER_PERIOD + 1:index + 1]
+    for index in range(period, len(candles)):
+        previous_window = prices[index - period:index]
+        current_window = prices[index - period + 1:index + 1]
         previous_middle = mean(previous_window)
-        previous_lower = previous_middle - BOLLINGER_STDDEV * pstdev(previous_window)
+        previous_lower = previous_middle - stddev * pstdev(previous_window)
         current_middle = mean(current_window)
-        current_lower = current_middle - BOLLINGER_STDDEV * pstdev(current_window)
+        current_lower = current_middle - stddev * pstdev(current_window)
         previous_price = prices[index - 1]
         current_price = prices[index]
 
