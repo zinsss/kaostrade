@@ -4,7 +4,7 @@ import argparse
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -510,6 +510,7 @@ def candle_price_near_timestamp(
     ts: str,
     settings: BacktestSettings,
 ) -> dict[str, float] | None:
+    start_ts, end_ts = price_window(ts, settings)
     row = conn.execute(
         """
         SELECT
@@ -519,10 +520,11 @@ def candle_price_near_timestamp(
         WHERE market = ?
           AND interval = '1m'
           AND trade_price IS NOT NULL
+          AND candle_date_time_utc BETWEEN ? AND ?
         ORDER BY distance_seconds ASC
         LIMIT 1
         """,
-        (ts, market),
+        (ts, market, start_ts, end_ts),
     ).fetchone()
     return price_candidate(row, settings)
 
@@ -533,6 +535,7 @@ def ticker_price_near_timestamp(
     ts: str,
     settings: BacktestSettings,
 ) -> dict[str, float] | None:
+    start_ts, end_ts = price_window(ts, settings)
     row = conn.execute(
         """
         SELECT
@@ -541,12 +544,23 @@ def ticker_price_near_timestamp(
         FROM ticker_snapshots
         WHERE market = ?
           AND trade_price IS NOT NULL
+          AND collected_at BETWEEN ? AND ?
         ORDER BY distance_seconds ASC
         LIMIT 1
         """,
-        (ts, market),
+        (ts, market, start_ts, end_ts),
     ).fetchone()
     return price_candidate(row, settings)
+
+
+def price_window(ts: str, settings: BacktestSettings) -> tuple[str, str]:
+    center = parse_utc_datetime(ts)
+    distance = timedelta(seconds=settings.max_price_distance_seconds)
+    return format_utc(center - distance), format_utc(center + distance)
+
+
+def format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def price_candidate(row: sqlite3.Row | None, settings: BacktestSettings) -> dict[str, float] | None:
