@@ -68,6 +68,9 @@ class Position:
 
 def main() -> None:
     args = parse_args()
+    if args.json_report and not (args.walk_forward or args.compare_all_strategies):
+        raise SystemExit("--json-report requires --walk-forward or --compare-all-strategies")
+
     config = load_config(CONFIG_PATH)
     db_path = config.get("database", {}).get("path", DEFAULT_DB_PATH)
     markets = resolve_markets(args, config)
@@ -345,25 +348,11 @@ def print_risk_comparison(conn: sqlite3.Connection, args: argparse.Namespace, ma
 
 
 def print_all_strategies_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
-    summaries = []
-    for strategy in STRATEGIES:
-        summary = run_backtest(
-            conn=conn,
-            strategy=strategy,
-            markets=markets,
-            days=args.days,
-            interval=args.interval,
-            trade_notional_krw=args.trade_notional_krw,
-            fee_rate=args.fee_rate,
-            min_signal_gap_minutes=args.min_signal_gap_minutes,
-            bollinger_period=args.bollinger_period,
-            bollinger_stddev=args.bollinger_stddev,
-            take_profit_pct=args.take_profit_pct,
-            stop_loss_pct=args.stop_loss_pct,
-            rsi_buy_threshold=args.rsi_buy_threshold,
-            rsi_sell_threshold=args.rsi_sell_threshold,
-        )
-        summaries.append(summary)
+    summaries = run_all_strategy_summaries(conn, args, markets)
+    if args.json_report:
+        report = build_compare_all_strategies_report(args, markets, summaries)
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return
 
     summaries.sort(key=lambda summary: summary["return_pct"], reverse=True)
 
@@ -386,6 +375,104 @@ def print_all_strategies_comparison(conn: sqlite3.Connection, args: argparse.Nam
         )
 
     Console(width=120).print(table)
+
+
+def run_all_strategy_summaries(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    markets: list[str],
+) -> list[dict[str, Any]]:
+    summaries = []
+    for strategy in STRATEGIES:
+        summary = run_backtest(
+            conn=conn,
+            strategy=strategy,
+            markets=markets,
+            days=args.days,
+            interval=args.interval,
+            trade_notional_krw=args.trade_notional_krw,
+            fee_rate=args.fee_rate,
+            min_signal_gap_minutes=args.min_signal_gap_minutes,
+            bollinger_period=args.bollinger_period,
+            bollinger_stddev=args.bollinger_stddev,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            rsi_buy_threshold=args.rsi_buy_threshold,
+            rsi_sell_threshold=args.rsi_sell_threshold,
+        )
+        summaries.append(summary)
+    return summaries
+
+
+def build_compare_all_strategies_report(
+    args: argparse.Namespace,
+    markets: list[str],
+    summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    strategy_reports = [compare_strategy_report(summary) for summary in summaries]
+    best_by_return = best_strategy_by_return(strategy_reports)
+    research_candidates = [
+        summary for summary in strategy_reports
+        if summary["verdict"] == "RESEARCH_CANDIDATE"
+    ]
+    return {
+        "mode": "compare_all_strategies",
+        "markets": markets,
+        "days": args.days,
+        "interval": args.interval,
+        "parameters": {
+            "trade_notional_krw": args.trade_notional_krw,
+            "fee_rate": args.fee_rate,
+            "min_signal_gap_minutes": args.min_signal_gap_minutes,
+            "bollinger_period": args.bollinger_period,
+            "bollinger_stddev": args.bollinger_stddev,
+            "rsi_buy_threshold": args.rsi_buy_threshold,
+            "rsi_sell_threshold": args.rsi_sell_threshold,
+            "take_profit_pct": args.take_profit_pct,
+            "stop_loss_pct": args.stop_loss_pct,
+        },
+        "strategies": strategy_reports,
+        "best_by_return": best_by_return,
+        "best_research_candidate": best_strategy_by_return(research_candidates),
+        "research_candidate_count": len(research_candidates),
+    }
+
+
+def compare_strategy_report(summary: dict[str, Any]) -> dict[str, Any]:
+    report = {
+        "strategy": summary["strategy"],
+        "return_pct": summary["return_pct"],
+        "trade_count": summary["trade_count"],
+        "buy_count": summary["buy_count"],
+        "sell_count": summary["sell_count"],
+        "total_fees_krw": summary["total_fees_krw"],
+        "max_drawdown_pct": summary["max_drawdown_pct"],
+        "average_hold_minutes": summary["average_hold_minutes"],
+        "take_profit_count": summary["take_profit_count"],
+        "stop_loss_count": summary["stop_loss_count"],
+        "signal_exit_count": summary["signal_exit_count"],
+    }
+    report["verdict"] = classify_single_backtest_verdict(report)
+    return report
+
+
+def classify_single_backtest_verdict(summary: dict[str, Any]) -> str:
+    trade_count = int(summary["trade_count"])
+    if trade_count == 0:
+        return "NO_TRADES"
+    if trade_count < 10:
+        return "TOO_FEW_TRADES"
+    if float(summary["return_pct"]) <= 0:
+        return "WEAK_EDGE"
+    if float(summary["max_drawdown_pct"]) > 2.0:
+        return "HIGH_DRAWDOWN"
+    return "RESEARCH_CANDIDATE"
+
+
+def best_strategy_by_return(summaries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not summaries:
+        return None
+    return max(summaries, key=lambda summary: float(summary["return_pct"]))
 
 
 def print_rsi_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
