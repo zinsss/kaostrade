@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import argparse
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 from app.backtest.candle_strategy import (
     Candle,
     aligned_mtf_trend,
+    build_compare_all_strategies_report,
     build_walk_forward_report,
+    classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
+    main,
     summarize_walk_forward,
     validate_strategy_interval,
 )
@@ -166,6 +170,142 @@ class WalkForwardJsonReportTests(unittest.TestCase):
         ])
 
         self.assertEqual(classify_walk_forward_verdict(summary), "RESEARCH_CANDIDATE")
+
+
+def compare_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        days=180,
+        interval="1m",
+        trade_notional_krw=10000.0,
+        fee_rate=0.0005,
+        min_signal_gap_minutes=60,
+        bollinger_period=20,
+        bollinger_stddev=3.0,
+        rsi_buy_threshold=25.0,
+        rsi_sell_threshold=55.0,
+        take_profit_pct=0.5,
+        stop_loss_pct=0.0,
+    )
+
+
+def strategy_summary(
+    strategy: str,
+    return_pct: float,
+    trade_count: int,
+    max_drawdown_pct: float = 0.2,
+) -> dict:
+    return {
+        "strategy": strategy,
+        "return_pct": return_pct,
+        "trade_count": trade_count,
+        "buy_count": trade_count // 2,
+        "sell_count": trade_count - (trade_count // 2),
+        "total_fees_krw": float(trade_count) * 5.0,
+        "max_drawdown_pct": max_drawdown_pct,
+        "average_hold_minutes": 25.0 if trade_count else None,
+        "take_profit_count": 1 if trade_count else 0,
+        "stop_loss_count": 0,
+        "signal_exit_count": max(0, trade_count // 2 - 1),
+    }
+
+
+class CompareAllStrategiesJsonReportTests(unittest.TestCase):
+    def test_compare_all_json_report_shape(self) -> None:
+        summaries = [
+            strategy_summary("ema", 0.5, 12, 0.4),
+            strategy_summary("rsi", -0.1, 14, 0.3),
+        ]
+
+        report = build_compare_all_strategies_report(compare_args(), ["KRW-BTC", "KRW-ETH"], summaries)
+
+        self.assertEqual(report["mode"], "compare_all_strategies")
+        self.assertEqual(report["markets"], ["KRW-BTC", "KRW-ETH"])
+        self.assertEqual(report["days"], 180)
+        self.assertEqual(report["interval"], "1m")
+        self.assertEqual(
+            report["parameters"],
+            {
+                "trade_notional_krw": 10000.0,
+                "fee_rate": 0.0005,
+                "min_signal_gap_minutes": 60,
+                "bollinger_period": 20,
+                "bollinger_stddev": 3.0,
+                "rsi_buy_threshold": 25.0,
+                "rsi_sell_threshold": 55.0,
+                "take_profit_pct": 0.5,
+                "stop_loss_pct": 0.0,
+            },
+        )
+        self.assertEqual(len(report["strategies"]), 2)
+        self.assertEqual(
+            set(report["strategies"][0]),
+            {
+                "strategy",
+                "return_pct",
+                "trade_count",
+                "buy_count",
+                "sell_count",
+                "total_fees_krw",
+                "max_drawdown_pct",
+                "average_hold_minutes",
+                "take_profit_count",
+                "stop_loss_count",
+                "signal_exit_count",
+                "verdict",
+            },
+        )
+        self.assertEqual(report["best_by_return"]["strategy"], "ema")
+        self.assertEqual(report["best_research_candidate"]["strategy"], "ema")
+        self.assertEqual(report["research_candidate_count"], 1)
+
+    def test_single_backtest_verdict_no_trades(self) -> None:
+        self.assertEqual(classify_single_backtest_verdict(strategy_summary("ema", 1.0, 0)), "NO_TRADES")
+
+    def test_single_backtest_verdict_too_few_trades(self) -> None:
+        self.assertEqual(classify_single_backtest_verdict(strategy_summary("ema", 1.0, 9)), "TOO_FEW_TRADES")
+
+    def test_single_backtest_verdict_weak_edge(self) -> None:
+        self.assertEqual(classify_single_backtest_verdict(strategy_summary("ema", 0.0, 10)), "WEAK_EDGE")
+
+    def test_single_backtest_verdict_high_drawdown(self) -> None:
+        self.assertEqual(classify_single_backtest_verdict(strategy_summary("ema", 1.0, 10, 2.1)), "HIGH_DRAWDOWN")
+
+    def test_single_backtest_verdict_research_candidate(self) -> None:
+        self.assertEqual(classify_single_backtest_verdict(strategy_summary("ema", 1.0, 10, 2.0)), "RESEARCH_CANDIDATE")
+
+    def test_best_by_return(self) -> None:
+        report = build_compare_all_strategies_report(
+            compare_args(),
+            ["KRW-BTC"],
+            [strategy_summary("ema", -0.1, 10), strategy_summary("rsi", 0.2, 10)],
+        )
+
+        self.assertEqual(report["best_by_return"]["strategy"], "rsi")
+
+    def test_best_research_candidate_when_candidate_exists(self) -> None:
+        report = build_compare_all_strategies_report(
+            compare_args(),
+            ["KRW-BTC"],
+            [strategy_summary("ema", 0.1, 10), strategy_summary("rsi", 0.2, 10)],
+        )
+
+        self.assertEqual(report["best_research_candidate"]["strategy"], "rsi")
+        self.assertEqual(report["research_candidate_count"], 2)
+
+    def test_best_research_candidate_when_no_candidate_exists(self) -> None:
+        report = build_compare_all_strategies_report(
+            compare_args(),
+            ["KRW-BTC"],
+            [strategy_summary("ema", -0.1, 10), strategy_summary("rsi", 0.2, 9)],
+        )
+
+        self.assertIsNone(report["best_research_candidate"])
+        self.assertEqual(report["research_candidate_count"], 0)
+
+    def test_json_report_requires_supported_mode(self) -> None:
+        with unittest.mock.patch("sys.argv", ["candle_strategy", "--json-report"]):
+            with self.assertRaisesRegex(SystemExit, "--json-report requires --walk-forward or --compare-all-strategies"):
+                main()
 
 
 if __name__ == "__main__":
