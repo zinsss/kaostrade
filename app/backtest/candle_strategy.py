@@ -19,6 +19,7 @@ DEFAULT_DAYS = 30
 DEFAULT_INTERVAL = "1m"
 DEFAULT_TRADE_NOTIONAL_KRW = 10_000.0
 DEFAULT_FEE_RATE = 0.0005
+DEFAULT_MIN_SIGNAL_GAP_MINUTES = 0
 STRATEGIES = ("ema", "bollinger")
 EMA_FAST = 20
 EMA_SLOW = 50
@@ -58,6 +59,7 @@ def main() -> None:
             interval=args.interval,
             trade_notional_krw=args.trade_notional_krw,
             fee_rate=args.fee_rate,
+            min_signal_gap_minutes=args.min_signal_gap_minutes,
         )
 
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
@@ -73,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval", default=DEFAULT_INTERVAL)
     parser.add_argument("--trade-notional-krw", type=positive_float, default=DEFAULT_TRADE_NOTIONAL_KRW)
     parser.add_argument("--fee-rate", type=non_negative_float, default=DEFAULT_FEE_RATE)
+    parser.add_argument("--min-signal-gap-minutes", type=non_negative_int, default=DEFAULT_MIN_SIGNAL_GAP_MINUTES)
     parser.add_argument("--compare", action="store_true")
     return parser.parse_args()
 
@@ -81,6 +84,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
     return parsed
 
 
@@ -135,6 +145,8 @@ def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets
     table = Table(title="Candle Strategy Comparison")
     table.add_column("strategy")
     table.add_column("trade_count", justify="right")
+    table.add_column("raw_signal_count", justify="right")
+    table.add_column("accepted_signal_count", justify="right")
     table.add_column("return_pct", justify="right")
     table.add_column("total_fees_krw", justify="right")
     table.add_column("average_hold_minutes", justify="right")
@@ -149,10 +161,13 @@ def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets
             interval=args.interval,
             trade_notional_krw=args.trade_notional_krw,
             fee_rate=args.fee_rate,
+            min_signal_gap_minutes=args.min_signal_gap_minutes,
         )
         table.add_row(
             strategy,
             str(summary["trade_count"]),
+            str(summary["raw_signal_count"]),
+            str(summary["accepted_signal_count"]),
             format_float(summary["return_pct"]),
             format_float(summary["total_fees_krw"]),
             format_optional_float(summary["average_hold_minutes"]),
@@ -170,6 +185,7 @@ def run_backtest(
     interval: str,
     trade_notional_krw: float,
     fee_rate: float,
+    min_signal_gap_minutes: int,
 ) -> dict[str, Any]:
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
@@ -186,6 +202,12 @@ def run_backtest(
         market: strategy_signals(strategy, load_candles(conn, market, interval, days))
         for market in markets
     }
+    raw_signal_count = sum(len(signals) for signals in signals_by_market.values())
+    signals_by_market = {
+        market: filter_signals_by_gap(signals, min_signal_gap_minutes)
+        for market, signals in signals_by_market.items()
+    }
+    accepted_signal_count = sum(len(signals) for signals in signals_by_market.values())
     events = sorted(
         (event for signals in signals_by_market.values() for event in signals),
         key=lambda event: (event["ts"], event["market"]),
@@ -234,6 +256,10 @@ def run_backtest(
     return {
         "strategy": strategy,
         "markets": markets,
+        "min_signal_gap_minutes": min_signal_gap_minutes,
+        "raw_signal_count": raw_signal_count,
+        "accepted_signal_count": accepted_signal_count,
+        "skipped_signal_count": raw_signal_count - accepted_signal_count,
         "start_cash": START_CASH_KRW,
         "final_equity": final_equity,
         "return_pct": (final_equity - START_CASH_KRW) / START_CASH_KRW * 100,
@@ -339,6 +365,24 @@ def bollinger_signals(candles: list[Candle]) -> list[dict[str, Any]]:
 
 def signal_event(candle: Candle, signal: str) -> dict[str, Any]:
     return {"market": candle.market, "ts": candle.ts, "price": candle.price, "signal": signal}
+
+
+def filter_signals_by_gap(signals: list[dict[str, Any]], min_signal_gap_minutes: int) -> list[dict[str, Any]]:
+    if min_signal_gap_minutes <= 0:
+        return signals
+
+    accepted = []
+    previous_signal_ts: datetime | None = None
+    min_gap_seconds = min_signal_gap_minutes * 60
+    for signal in signals:
+        signal_ts = parse_utc_datetime(signal["ts"])
+        if previous_signal_ts is not None:
+            elapsed_seconds = (signal_ts - previous_signal_ts).total_seconds()
+            if elapsed_seconds < min_gap_seconds:
+                continue
+        accepted.append(signal)
+        previous_signal_ts = signal_ts
+    return accepted
 
 
 def final_market_prices(conn: sqlite3.Connection, markets: list[str], interval: str, days: int) -> dict[str, float]:
