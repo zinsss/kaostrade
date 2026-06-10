@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,6 +42,10 @@ DEFAULT_BOLLINGER_PERIOD = 20
 DEFAULT_BOLLINGER_STDDEV = 2.0
 BOLLINGER_SWEEP_PERIODS = (10, 20, 30)
 BOLLINGER_SWEEP_STDDEVS = (1.5, 2.0, 2.5, 3.0)
+BOLLINGER_RSI_SWEEP_PERIODS = (10, 20, 30)
+BOLLINGER_RSI_SWEEP_STDDEVS = (2.0, 2.5, 3.0)
+BOLLINGER_RSI_SWEEP_BUY_THRESHOLDS = (20.0, 25.0, 30.0)
+BOLLINGER_RSI_SWEEP_SELL_THRESHOLDS = (55.0, 60.0, 65.0)
 RSI_PERIOD = 14
 DEFAULT_RSI_BUY_THRESHOLD = 30.0
 DEFAULT_RSI_SELL_THRESHOLD = 60.0
@@ -68,8 +73,8 @@ class Position:
 
 def main() -> None:
     args = parse_args()
-    if args.json_report and not (args.walk_forward or args.compare_all_strategies):
-        raise SystemExit("--json-report requires --walk-forward or --compare-all-strategies")
+    if args.json_report and not (args.walk_forward or args.compare_all_strategies or args.compare_bollinger_rsi):
+        raise SystemExit("--json-report requires --walk-forward, --compare-all-strategies, or --compare-bollinger-rsi")
 
     config = load_config(CONFIG_PATH)
     db_path = config.get("database", {}).get("path", DEFAULT_DB_PATH)
@@ -87,6 +92,9 @@ def main() -> None:
             return
         if args.compare_all_strategies:
             print_all_strategies_comparison(conn, args, markets)
+            return
+        if args.compare_bollinger_rsi:
+            print_bollinger_rsi_comparison(conn, args, markets)
             return
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
@@ -139,6 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-bollinger", action="store_true")
     parser.add_argument("--compare-risk", action="store_true")
     parser.add_argument("--compare-all-strategies", action="store_true")
+    parser.add_argument("--compare-bollinger-rsi", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--json-report", action="store_true")
@@ -473,6 +482,170 @@ def best_strategy_by_return(summaries: list[dict[str, Any]]) -> dict[str, Any] |
     if not summaries:
         return None
     return max(summaries, key=lambda summary: float(summary["return_pct"]))
+
+
+def print_bollinger_rsi_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    results = run_bollinger_rsi_sweep(conn, args, markets)
+    if args.json_report:
+        report = build_bollinger_rsi_sweep_report(args, markets, results)
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    table = Table(title="Bollinger/RSI Parameter Sweep")
+    table.add_column("strategy")
+    table.add_column("period", justify="right")
+    table.add_column("stddev", justify="right")
+    table.add_column("rsi_buy", justify="right")
+    table.add_column("rsi_sell", justify="right")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("verdict")
+
+    for result in sorted(results, key=lambda item: item["return_pct"], reverse=True):
+        table.add_row(
+            result["strategy"],
+            str(result["bollinger_period"]),
+            format_float(result["bollinger_stddev"]),
+            format_float(result["rsi_buy_threshold"]),
+            format_float(result["rsi_sell_threshold"]),
+            str(result["trade_count"]),
+            format_float(result["return_pct"]),
+            format_float(result["total_fees_krw"]),
+            format_float(result["max_drawdown_pct"]),
+            result["verdict"],
+        )
+
+    Console(width=160).print(table)
+
+
+def run_bollinger_rsi_sweep(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    markets: list[str],
+) -> list[dict[str, Any]]:
+    grid = bollinger_rsi_parameter_grid()
+    results = []
+    total_runs = len(grid)
+    for index, params in enumerate(grid, start=1):
+        print(
+            f"[{index}/{total_runs}] "
+            f"bollinger_period={params['bollinger_period']} "
+            f"stddev={params['bollinger_stddev']} "
+            f"rsi_buy={params['rsi_buy_threshold']} "
+            f"rsi_sell={params['rsi_sell_threshold']}",
+            file=sys.stderr,
+            flush=True,
+        )
+        results.append(run_bollinger_rsi_sweep_item(conn, args, markets, params))
+    return results
+
+
+def bollinger_rsi_parameter_grid() -> list[dict[str, Any]]:
+    return [
+        {
+            "bollinger_period": period,
+            "bollinger_stddev": stddev,
+            "rsi_buy_threshold": buy_threshold,
+            "rsi_sell_threshold": sell_threshold,
+        }
+        for period in BOLLINGER_RSI_SWEEP_PERIODS
+        for stddev in BOLLINGER_RSI_SWEEP_STDDEVS
+        for buy_threshold in BOLLINGER_RSI_SWEEP_BUY_THRESHOLDS
+        for sell_threshold in BOLLINGER_RSI_SWEEP_SELL_THRESHOLDS
+    ]
+
+
+def run_bollinger_rsi_sweep_item(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    markets: list[str],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    summary = run_backtest(
+        conn=conn,
+        strategy=args.strategy,
+        markets=markets,
+        days=args.days,
+        interval=args.interval,
+        trade_notional_krw=args.trade_notional_krw,
+        fee_rate=args.fee_rate,
+        min_signal_gap_minutes=args.min_signal_gap_minutes,
+        bollinger_period=params["bollinger_period"],
+        bollinger_stddev=params["bollinger_stddev"],
+        take_profit_pct=args.take_profit_pct,
+        stop_loss_pct=args.stop_loss_pct,
+        rsi_buy_threshold=params["rsi_buy_threshold"],
+        rsi_sell_threshold=params["rsi_sell_threshold"],
+    )
+    return bollinger_rsi_sweep_result(summary, args, params)
+
+
+def bollinger_rsi_sweep_result(
+    summary: dict[str, Any],
+    args: argparse.Namespace,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    result = {
+        "strategy": summary["strategy"],
+        "bollinger_period": params["bollinger_period"],
+        "bollinger_stddev": params["bollinger_stddev"],
+        "rsi_buy_threshold": params["rsi_buy_threshold"],
+        "rsi_sell_threshold": params["rsi_sell_threshold"],
+        "take_profit_pct": args.take_profit_pct,
+        "stop_loss_pct": args.stop_loss_pct,
+        "min_signal_gap_minutes": args.min_signal_gap_minutes,
+        "trade_notional_krw": args.trade_notional_krw,
+        "fee_rate": args.fee_rate,
+        "return_pct": summary["return_pct"],
+        "trade_count": summary["trade_count"],
+        "buy_count": summary["buy_count"],
+        "sell_count": summary["sell_count"],
+        "total_fees_krw": summary["total_fees_krw"],
+        "max_drawdown_pct": summary["max_drawdown_pct"],
+        "average_hold_minutes": summary["average_hold_minutes"],
+        "take_profit_count": summary["take_profit_count"],
+        "stop_loss_count": summary["stop_loss_count"],
+        "signal_exit_count": summary["signal_exit_count"],
+    }
+    result["verdict"] = classify_single_backtest_verdict(result)
+    return result
+
+
+def build_bollinger_rsi_sweep_report(
+    args: argparse.Namespace,
+    markets: list[str],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sorted_results = sorted(results, key=lambda result: result["return_pct"], reverse=True)
+    research_candidates = [
+        result for result in sorted_results
+        if result["verdict"] == "RESEARCH_CANDIDATE"
+    ]
+    return {
+        "mode": "bollinger_rsi_parameter_sweep",
+        "markets": markets,
+        "days": args.days,
+        "interval": args.interval,
+        "strategy": args.strategy,
+        "parameter_grid": bollinger_rsi_parameter_grid_summary(),
+        "result_count": len(sorted_results),
+        "research_candidate_count": len(research_candidates),
+        "best_by_return": best_strategy_by_return(sorted_results),
+        "best_research_candidate": best_strategy_by_return(research_candidates),
+        "results": sorted_results,
+    }
+
+
+def bollinger_rsi_parameter_grid_summary() -> dict[str, Any]:
+    return {
+        "bollinger_periods": list(BOLLINGER_RSI_SWEEP_PERIODS),
+        "bollinger_stddevs": list(BOLLINGER_RSI_SWEEP_STDDEVS),
+        "rsi_buy_thresholds": list(BOLLINGER_RSI_SWEEP_BUY_THRESHOLDS),
+        "rsi_sell_thresholds": list(BOLLINGER_RSI_SWEEP_SELL_THRESHOLDS),
+        "total_runs": len(bollinger_rsi_parameter_grid()),
+    }
 
 
 def print_rsi_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
