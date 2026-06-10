@@ -33,12 +33,18 @@ class BithumbPublicClient:
             return []
         return self._get_list("/v1/orderbook", params={"markets": ",".join(markets)})
 
-    def get_candles(self, market: str, interval: str, count: int = 200) -> list[dict[str, Any]]:
+    def get_candles(
+        self,
+        market: str,
+        interval: str,
+        count: int = 200,
+        to: str | None = None,
+    ) -> list[dict[str, Any]]:
         unit = self._minute_unit(interval)
-        return self._get_list(
-            f"/v1/candles/minutes/{unit}",
-            params={"market": market, "count": str(count)},
-        )
+        params = {"market": market, "count": str(count)}
+        if to is not None:
+            params["to"] = to
+        return self._get_list(f"/v1/candles/minutes/{unit}", params=params)
 
     def _get_list(self, path: str, params: dict[str, str]) -> list[dict[str, Any]]:
         response = self._client.get(path, params=params)
@@ -49,9 +55,11 @@ class BithumbPublicClient:
         return payload
 
     def _minute_unit(self, interval: str) -> int:
+        if interval == "1h":
+            return 60
         if not interval.endswith("m"):
             raise ValueError(f"Unsupported candle interval: {interval}")
         unit = int(interval[:-1])
-        if unit <= 0:
+        if unit not in {1, 5, 15}:
             raise ValueError(f"Unsupported candle interval: {interval}")
         return unit
