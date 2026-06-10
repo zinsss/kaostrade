@@ -138,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-all-strategies", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
+    parser.add_argument("--json-report", action="store_true")
     parser.add_argument("--breakdown-by-market", action="store_true")
     return parser.parse_args()
 
@@ -437,6 +438,57 @@ def print_rsi_comparison(conn: sqlite3.Connection, args: argparse.Namespace, mar
 
 
 def print_walk_forward(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    summaries = run_walk_forward_summaries(conn, args, markets)
+    if args.json_report:
+        report = build_walk_forward_report(args, markets, summaries)
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    table = Table(title="Walk-Forward Backtest")
+    table.add_column("window_start")
+    table.add_column("window_end")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for summary in summaries:
+        table.add_row(
+            summary["window_start"],
+            summary["window_end"],
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_float(summary["max_drawdown_pct"]),
+        )
+
+    report_summary = summarize_walk_forward(summaries)
+    summary_table = Table(title="Walk-Forward Summary")
+    summary_table.add_column("average_return_pct", justify="right")
+    summary_table.add_column("median_return_pct", justify="right")
+    summary_table.add_column("positive_window_count", justify="right")
+    summary_table.add_column("negative_window_count", justify="right")
+    summary_table.add_column("worst_window_return_pct", justify="right")
+    summary_table.add_column("best_window_return_pct", justify="right")
+    summary_table.add_row(
+        format_optional_float(report_summary["average_return_pct"]),
+        format_optional_float(report_summary["median_return_pct"]),
+        str(report_summary["positive_window_count"]),
+        str(report_summary["negative_window_count"]),
+        format_optional_float(report_summary["worst_window_return_pct"]),
+        format_optional_float(report_summary["best_window_return_pct"]),
+    )
+
+    console = Console(width=140)
+    console.print(table)
+    console.print(summary_table)
+
+
+def run_walk_forward_summaries(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    markets: list[str],
+) -> list[dict[str, Any]]:
     windows = walk_forward_windows(args.days, args.walk_forward_window_days)
     summaries = []
     for window_start, window_end in windows:
@@ -461,45 +513,80 @@ def print_walk_forward(conn: sqlite3.Connection, args: argparse.Namespace, marke
         summary["window_start"] = format_utc(window_start)
         summary["window_end"] = format_utc(window_end)
         summaries.append(summary)
+    return summaries
 
-    table = Table(title="Walk-Forward Backtest")
-    table.add_column("window_start")
-    table.add_column("window_end")
-    table.add_column("trade_count", justify="right")
-    table.add_column("return_pct", justify="right")
-    table.add_column("total_fees_krw", justify="right")
-    table.add_column("max_drawdown_pct", justify="right")
 
-    for summary in summaries:
-        table.add_row(
-            summary["window_start"],
-            summary["window_end"],
-            str(summary["trade_count"]),
-            format_float(summary["return_pct"]),
-            format_float(summary["total_fees_krw"]),
-            format_float(summary["max_drawdown_pct"]),
-        )
+def build_walk_forward_report(
+    args: argparse.Namespace,
+    markets: list[str],
+    summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    report_summary = summarize_walk_forward(summaries)
+    return {
+        "strategy": args.strategy,
+        "markets": markets,
+        "days": args.days,
+        "interval": args.interval,
+        "walk_forward_window_days": args.walk_forward_window_days,
+        "parameters": {
+            "bollinger_period": args.bollinger_period,
+            "bollinger_stddev": args.bollinger_stddev,
+            "rsi_buy_threshold": args.rsi_buy_threshold,
+            "rsi_sell_threshold": args.rsi_sell_threshold,
+            "take_profit_pct": args.take_profit_pct,
+            "stop_loss_pct": args.stop_loss_pct,
+            "min_signal_gap_minutes": args.min_signal_gap_minutes,
+        },
+        "windows": [walk_forward_window_report(summary) for summary in summaries],
+        "summary": report_summary,
+        "verdict": classify_walk_forward_verdict(report_summary),
+    }
 
+
+def walk_forward_window_report(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "window_start": summary["window_start"],
+        "window_end": summary["window_end"],
+        "return_pct": summary["return_pct"],
+        "trade_count": summary["trade_count"],
+        "buy_count": summary["buy_count"],
+        "sell_count": summary["sell_count"],
+        "total_fees_krw": summary["total_fees_krw"],
+        "max_drawdown_pct": summary["max_drawdown_pct"],
+        "average_hold_minutes": summary["average_hold_minutes"],
+    }
+
+
+def summarize_walk_forward(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     returns = [float(summary["return_pct"]) for summary in summaries]
-    summary_table = Table(title="Walk-Forward Summary")
-    summary_table.add_column("average_return_pct", justify="right")
-    summary_table.add_column("median_return_pct", justify="right")
-    summary_table.add_column("positive_window_count", justify="right")
-    summary_table.add_column("negative_window_count", justify="right")
-    summary_table.add_column("worst_window_return_pct", justify="right")
-    summary_table.add_column("best_window_return_pct", justify="right")
-    summary_table.add_row(
-        format_float(sum(returns) / len(returns)) if returns else "-",
-        format_float(median(returns)) if returns else "-",
-        str(sum(1 for value in returns if value > 0)),
-        str(sum(1 for value in returns if value < 0)),
-        format_float(min(returns)) if returns else "-",
-        format_float(max(returns)) if returns else "-",
-    )
+    trade_counts = [int(summary["trade_count"]) for summary in summaries]
+    drawdowns = [float(summary["max_drawdown_pct"]) for summary in summaries]
+    return {
+        "average_return_pct": mean(returns) if returns else None,
+        "median_return_pct": median(returns) if returns else None,
+        "positive_window_count": sum(1 for value in returns if value > 0),
+        "negative_window_count": sum(1 for value in returns if value < 0),
+        "worst_window_return_pct": min(returns) if returns else None,
+        "best_window_return_pct": max(returns) if returns else None,
+        "total_trade_count": sum(trade_counts),
+        "average_trade_count_per_window": mean(trade_counts) if trade_counts else None,
+        "average_max_drawdown_pct": mean(drawdowns) if drawdowns else None,
+        "worst_max_drawdown_pct": max(drawdowns) if drawdowns else None,
+    }
 
-    console = Console(width=140)
-    console.print(table)
-    console.print(summary_table)
+
+def classify_walk_forward_verdict(summary: dict[str, Any]) -> str:
+    total_trade_count = int(summary["total_trade_count"])
+    if total_trade_count == 0:
+        return "NO_TRADES"
+    if total_trade_count < 10:
+        return "TOO_FEW_TRADES"
+    if summary["negative_window_count"] > summary["positive_window_count"]:
+        return "UNSTABLE"
+    average_return_pct = summary["average_return_pct"]
+    if average_return_pct is None or average_return_pct <= 0:
+        return "WEAK_EDGE"
+    return "RESEARCH_CANDIDATE"
 
 
 def walk_forward_windows(days: int, window_days: int) -> list[tuple[datetime, datetime]]:
