@@ -33,6 +33,7 @@ def generate_market_features(conn: sqlite3.Connection) -> dict[str, Any]:
 
     features = {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "source": "live",
         "btc_return_1h": returns_by_market.get("KRW-BTC"),
         "eth_return_1h": returns_by_market.get("KRW-ETH"),
         "median_return_1h": median(returns) if returns else None,

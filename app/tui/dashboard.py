@@ -77,6 +77,7 @@ def latest_regime(conn: sqlite3.Connection) -> sqlite3.Row | None:
             average_imbalance_5,
             market_count
         FROM market_regimes
+        WHERE source = 'live'
         ORDER BY id DESC
         LIMIT 1
         """

@@ -19,6 +19,7 @@ DEFAULT_EXIT_STREAK = 3
 DEFAULT_TRADE_NOTIONAL_KRW = 10_000.0
 DEFAULT_FEE_RATE = 0.0005
 DEFAULT_MAX_PRICE_DISTANCE_SECONDS = 300
+DEFAULT_SOURCE = "backfill"
 MARKETS = ("KRW-BTC", "KRW-ETH")
 
 
@@ -30,6 +31,7 @@ class BacktestSettings:
     trade_notional_krw: float = DEFAULT_TRADE_NOTIONAL_KRW
     fee_rate: float = DEFAULT_FEE_RATE
     max_price_distance_seconds: int = DEFAULT_MAX_PRICE_DISTANCE_SECONDS
+    source: str = DEFAULT_SOURCE
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -39,6 +41,7 @@ class BacktestSettings:
             "trade_notional_krw": self.trade_notional_krw,
             "fee_rate": self.fee_rate,
             "max_price_distance_seconds": self.max_price_distance_seconds,
+            "source": self.source,
         }
 
 
@@ -71,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-notional-krw", type=positive_float, default=DEFAULT_TRADE_NOTIONAL_KRW)
     parser.add_argument("--fee-rate", type=non_negative_float, default=DEFAULT_FEE_RATE)
     parser.add_argument("--max-price-distance-seconds", type=positive_int, default=DEFAULT_MAX_PRICE_DISTANCE_SECONDS)
+    parser.add_argument("--source", choices=("backfill", "live", "all"), default=DEFAULT_SOURCE)
     parser.add_argument("--compare", action="store_true")
     return parser.parse_args()
 
@@ -104,6 +108,7 @@ def settings_from_args(args: argparse.Namespace) -> BacktestSettings:
         trade_notional_krw=args.trade_notional_krw,
         fee_rate=args.fee_rate,
         max_price_distance_seconds=args.max_price_distance_seconds,
+        source=args.source,
     )
 
 
@@ -126,6 +131,7 @@ def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace) -> None
             trade_notional_krw=args.trade_notional_krw,
             fee_rate=args.fee_rate,
             max_price_distance_seconds=args.max_price_distance_seconds,
+            source=args.source,
         )
         summary = run_backtest(conn, settings)
         table.add_row(
@@ -177,7 +183,7 @@ def run_backtest(conn: sqlite3.Connection, settings: BacktestSettings | None = N
     risk_on_streak = 0
     risk_off_streak = 0
 
-    regimes = load_regimes(conn)
+    regimes = load_regimes(conn, settings.source)
     for regime_row in regimes:
         ts = str(regime_row["ts"])
         regime = str(regime_row["regime"])
@@ -370,13 +376,24 @@ def parse_utc_datetime(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def load_regimes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def load_regimes(conn: sqlite3.Connection, source: str = DEFAULT_SOURCE) -> list[sqlite3.Row]:
+    if source == "all":
+        return conn.execute(
+            """
+            SELECT id, ts, regime
+            FROM market_regimes
+            ORDER BY ts ASC, id ASC
+            """
+        ).fetchall()
+
     return conn.execute(
         """
         SELECT id, ts, regime
         FROM market_regimes
+        WHERE source = ?
         ORDER BY ts ASC, id ASC
-        """
+        """,
+        (source,),
     ).fetchall()
 
 
