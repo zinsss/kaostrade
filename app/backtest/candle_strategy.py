@@ -20,6 +20,10 @@ DEFAULT_INTERVAL = "1m"
 DEFAULT_TRADE_NOTIONAL_KRW = 10_000.0
 DEFAULT_FEE_RATE = 0.0005
 DEFAULT_MIN_SIGNAL_GAP_MINUTES = 0
+DEFAULT_TAKE_PROFIT_PCT = 0.0
+DEFAULT_STOP_LOSS_PCT = 0.0
+RISK_SWEEP_TAKE_PROFIT_PCTS = (0.0, 0.5, 1.0, 1.5)
+RISK_SWEEP_STOP_LOSS_PCTS = (0.0, 0.5, 1.0)
 STRATEGIES = ("ema", "bollinger")
 EMA_FAST = 20
 EMA_SLOW = 50
@@ -56,6 +60,9 @@ def main() -> None:
         if args.compare_bollinger:
             print_bollinger_comparison(conn, args, markets)
             return
+        if args.compare_risk:
+            print_risk_comparison(conn, args, markets)
+            return
         summary = run_backtest(
             conn=conn,
             strategy=args.strategy,
@@ -67,6 +74,8 @@ def main() -> None:
             min_signal_gap_minutes=args.min_signal_gap_minutes,
             bollinger_period=args.bollinger_period,
             bollinger_stddev=args.bollinger_stddev,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
         )
 
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
@@ -85,8 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-signal-gap-minutes", type=non_negative_int, default=DEFAULT_MIN_SIGNAL_GAP_MINUTES)
     parser.add_argument("--bollinger-period", type=positive_int, default=DEFAULT_BOLLINGER_PERIOD)
     parser.add_argument("--bollinger-stddev", type=positive_float, default=DEFAULT_BOLLINGER_STDDEV)
+    parser.add_argument("--take-profit-pct", type=non_negative_float, default=DEFAULT_TAKE_PROFIT_PCT)
+    parser.add_argument("--stop-loss-pct", type=non_negative_float, default=DEFAULT_STOP_LOSS_PCT)
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--compare-bollinger", action="store_true")
+    parser.add_argument("--compare-risk", action="store_true")
     return parser.parse_args()
 
 
@@ -174,6 +186,8 @@ def print_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets
             min_signal_gap_minutes=args.min_signal_gap_minutes,
             bollinger_period=args.bollinger_period,
             bollinger_stddev=args.bollinger_stddev,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
         )
         table.add_row(
             strategy,
@@ -204,6 +218,8 @@ def print_bollinger_comparison(conn: sqlite3.Connection, args: argparse.Namespac
                 min_signal_gap_minutes=args.min_signal_gap_minutes,
                 bollinger_period=period,
                 bollinger_stddev=stddev,
+                take_profit_pct=args.take_profit_pct,
+                stop_loss_pct=args.stop_loss_pct,
             )
             summaries.append(summary)
 
@@ -232,6 +248,55 @@ def print_bollinger_comparison(conn: sqlite3.Connection, args: argparse.Namespac
     Console(width=120).print(table)
 
 
+def print_risk_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    summaries = []
+    for take_profit_pct in RISK_SWEEP_TAKE_PROFIT_PCTS:
+        for stop_loss_pct in RISK_SWEEP_STOP_LOSS_PCTS:
+            summary = run_backtest(
+                conn=conn,
+                strategy="bollinger",
+                markets=markets,
+                days=args.days,
+                interval=args.interval,
+                trade_notional_krw=args.trade_notional_krw,
+                fee_rate=args.fee_rate,
+                min_signal_gap_minutes=args.min_signal_gap_minutes,
+                bollinger_period=20,
+                bollinger_stddev=3.0,
+                take_profit_pct=take_profit_pct,
+                stop_loss_pct=stop_loss_pct,
+            )
+            summaries.append(summary)
+
+    summaries.sort(key=lambda summary: summary["return_pct"], reverse=True)
+
+    table = Table(title="Candle Risk Control Sweep")
+    table.add_column("take_profit_pct", justify="right")
+    table.add_column("stop_loss_pct", justify="right")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("take_profit_count", justify="right")
+    table.add_column("stop_loss_count", justify="right")
+
+    for summary in summaries:
+        table.add_row(
+            format_float(summary["take_profit_pct"]),
+            format_float(summary["stop_loss_pct"]),
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_optional_float(summary["average_hold_minutes"]),
+            format_float(summary["max_drawdown_pct"]),
+            str(summary["take_profit_count"]),
+            str(summary["stop_loss_count"]),
+        )
+
+    Console(width=140).print(table)
+
+
 def run_backtest(
     conn: sqlite3.Connection,
     strategy: str,
@@ -243,11 +308,16 @@ def run_backtest(
     min_signal_gap_minutes: int,
     bollinger_period: int,
     bollinger_stddev: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
 ) -> dict[str, Any]:
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
     buy_count = 0
     sell_count = 0
+    take_profit_count = 0
+    stop_loss_count = 0
+    signal_exit_count = 0
     total_fees_krw = 0.0
     realized_pnl_krw = 0.0
     trades: list[dict[str, Any]] = []
@@ -255,14 +325,18 @@ def run_backtest(
     equity_curve: list[dict[str, Any]] = []
     latest_prices: dict[str, float] = {}
 
+    candles_by_market = {
+        market: load_candles(conn, market, interval, days)
+        for market in markets
+    }
     signals_by_market = {
         market: strategy_signals(
             strategy,
-            load_candles(conn, market, interval, days),
+            candles,
             bollinger_period=bollinger_period,
             bollinger_stddev=bollinger_stddev,
         )
-        for market in markets
+        for market, candles in candles_by_market.items()
     }
     raw_signal_count = sum(len(signals) for signals in signals_by_market.values())
     signals_by_market = {
@@ -270,7 +344,8 @@ def run_backtest(
         for market, signals in signals_by_market.items()
     }
     accepted_signal_count = sum(len(signals) for signals in signals_by_market.values())
-    events = sorted(
+    risk_controls_enabled = take_profit_pct > 0 or stop_loss_pct > 0
+    events = build_price_events(candles_by_market, signals_by_market) if risk_controls_enabled else sorted(
         (event for signals in signals_by_market.values() for event in signals),
         key=lambda event: (event["ts"], event["market"]),
     )
@@ -280,9 +355,29 @@ def run_backtest(
         ts = event["ts"]
         price = float(event["price"])
         latest_prices[market] = price
-        signal = event["signal"]
+        signal = event.get("signal")
 
-        if signal == "BUY" and market not in positions:
+        risk_exit_reason = risk_exit_for_position(
+            positions.get(market),
+            price,
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+        )
+        if risk_exit_reason is not None:
+            position = positions.pop(market)
+            cash, realized_delta, fee_krw, trade = close_position(
+                cash, position, ts, market, price, fee_rate, risk_exit_reason
+            )
+            realized_pnl_krw += realized_delta
+            total_fees_krw += fee_krw
+            sell_count += 1
+            if risk_exit_reason == "TAKE_PROFIT":
+                take_profit_count += 1
+            elif risk_exit_reason == "STOP_LOSS":
+                stop_loss_count += 1
+            hold_minutes.append(position_hold_minutes(position, ts))
+            trades.append(trade)
+        elif signal == "BUY" and market not in positions:
             total_cost = trade_notional_krw * (1 + fee_rate)
             if cash >= total_cost:
                 quantity = trade_notional_krw / price
@@ -291,17 +386,18 @@ def run_backtest(
                 positions[market] = Position(quantity=quantity, average_entry_price=price, entry_ts=ts)
                 total_fees_krw += fee_krw
                 buy_count += 1
-                trades.append(simulated_trade(ts, "BUY", market, price, quantity, trade_notional_krw, fee_krw))
+                trades.append(simulated_trade(ts, "BUY", market, price, quantity, trade_notional_krw, fee_krw, "SIGNAL"))
         elif signal == "SELL" and market in positions:
             position = positions.pop(market)
-            notional = position.quantity * price
-            fee_krw = notional * fee_rate
-            cash += notional - fee_krw
-            realized_pnl_krw += notional - fee_krw - (position.quantity * position.average_entry_price)
+            cash, realized_delta, fee_krw, trade = close_position(
+                cash, position, ts, market, price, fee_rate, "SIGNAL"
+            )
+            realized_pnl_krw += realized_delta
             total_fees_krw += fee_krw
             sell_count += 1
+            signal_exit_count += 1
             hold_minutes.append(position_hold_minutes(position, ts))
-            trades.append(simulated_trade(ts, "SELL", market, price, position.quantity, notional, fee_krw))
+            trades.append(trade)
 
         equity_curve.append(
             {
@@ -321,6 +417,8 @@ def run_backtest(
         "min_signal_gap_minutes": min_signal_gap_minutes,
         "bollinger_period": bollinger_period if strategy == "bollinger" else None,
         "bollinger_stddev": bollinger_stddev if strategy == "bollinger" else None,
+        "take_profit_pct": take_profit_pct,
+        "stop_loss_pct": stop_loss_pct,
         "raw_signal_count": raw_signal_count,
         "accepted_signal_count": accepted_signal_count,
         "skipped_signal_count": raw_signal_count - accepted_signal_count,
@@ -330,6 +428,9 @@ def run_backtest(
         "trade_count": buy_count + sell_count,
         "buy_count": buy_count,
         "sell_count": sell_count,
+        "take_profit_count": take_profit_count,
+        "stop_loss_count": stop_loss_count,
+        "signal_exit_count": signal_exit_count,
         "total_fees_krw": total_fees_krw,
         "realized_pnl_krw": realized_pnl_krw,
         "max_drawdown_pct": max_drawdown_pct(equity_curve),
@@ -436,6 +537,29 @@ def signal_event(candle: Candle, signal: str) -> dict[str, Any]:
     return {"market": candle.market, "ts": candle.ts, "price": candle.price, "signal": signal}
 
 
+def build_price_events(
+    candles_by_market: dict[str, list[Candle]],
+    signals_by_market: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    signal_lookup = {
+        (signal["market"], signal["ts"]): signal["signal"]
+        for signals in signals_by_market.values()
+        for signal in signals
+    }
+    events = []
+    for market, candles in candles_by_market.items():
+        for candle in candles:
+            events.append(
+                {
+                    "market": market,
+                    "ts": candle.ts,
+                    "price": candle.price,
+                    "signal": signal_lookup.get((market, candle.ts)),
+                }
+            )
+    return sorted(events, key=lambda event: (event["ts"], event["market"]))
+
+
 def filter_signals_by_gap(signals: list[dict[str, Any]], min_signal_gap_minutes: int) -> list[dict[str, Any]]:
     if min_signal_gap_minutes <= 0:
         return signals
@@ -463,6 +587,38 @@ def final_market_prices(conn: sqlite3.Connection, markets: list[str], interval: 
     return prices
 
 
+def risk_exit_for_position(
+    position: Position | None,
+    price: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+) -> str | None:
+    if position is None:
+        return None
+    if take_profit_pct > 0 and price >= position.average_entry_price * (1 + take_profit_pct / 100):
+        return "TAKE_PROFIT"
+    if stop_loss_pct > 0 and price <= position.average_entry_price * (1 - stop_loss_pct / 100):
+        return "STOP_LOSS"
+    return None
+
+
+def close_position(
+    cash: float,
+    position: Position,
+    ts: str,
+    market: str,
+    price: float,
+    fee_rate: float,
+    reason: str,
+) -> tuple[float, float, float, dict[str, Any]]:
+    notional = position.quantity * price
+    fee_krw = notional * fee_rate
+    new_cash = cash + notional - fee_krw
+    realized_delta = notional - fee_krw - (position.quantity * position.average_entry_price)
+    trade = simulated_trade(ts, "SELL", market, price, position.quantity, notional, fee_krw, reason)
+    return new_cash, realized_delta, fee_krw, trade
+
+
 def simulated_trade(
     ts: str,
     side: str,
@@ -471,6 +627,7 @@ def simulated_trade(
     quantity: float,
     notional_krw: float,
     fee_krw: float,
+    reason: str,
 ) -> dict[str, Any]:
     return {
         "ts": ts,
@@ -480,6 +637,7 @@ def simulated_trade(
         "quantity": quantity,
         "notional_krw": notional_krw,
         "fee_krw": fee_krw,
+        "reason": reason,
     }
 
 
