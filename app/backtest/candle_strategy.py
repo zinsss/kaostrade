@@ -24,13 +24,20 @@ DEFAULT_TAKE_PROFIT_PCT = 0.0
 DEFAULT_STOP_LOSS_PCT = 0.0
 RISK_SWEEP_TAKE_PROFIT_PCTS = (0.0, 0.5, 1.0, 1.5)
 RISK_SWEEP_STOP_LOSS_PCTS = (0.0, 0.5, 1.0)
-STRATEGIES = ("ema", "bollinger")
+STRATEGIES = ("ema", "bollinger", "rsi", "ema_rsi", "donchian")
 EMA_FAST = 20
 EMA_SLOW = 50
 DEFAULT_BOLLINGER_PERIOD = 20
 DEFAULT_BOLLINGER_STDDEV = 2.0
 BOLLINGER_SWEEP_PERIODS = (10, 20, 30)
 BOLLINGER_SWEEP_STDDEVS = (1.5, 2.0, 2.5, 3.0)
+RSI_PERIOD = 14
+RSI_BUY_THRESHOLD = 30.0
+RSI_SELL_THRESHOLD = 60.0
+EMA_RSI_BUY_THRESHOLD = 55.0
+EMA_RSI_SELL_THRESHOLD = 45.0
+DONCHIAN_ENTRY_CHANNEL = 20
+DONCHIAN_EXIT_CHANNEL = 10
 
 
 @dataclass
@@ -62,6 +69,9 @@ def main() -> None:
             return
         if args.compare_risk:
             print_risk_comparison(conn, args, markets)
+            return
+        if args.compare_all_strategies:
+            print_all_strategies_comparison(conn, args, markets)
             return
         if args.breakdown_by_market:
             print_market_breakdown(conn, args, markets)
@@ -102,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--compare-bollinger", action="store_true")
     parser.add_argument("--compare-risk", action="store_true")
+    parser.add_argument("--compare-all-strategies", action="store_true")
     parser.add_argument("--breakdown-by-market", action="store_true")
     return parser.parse_args()
 
@@ -299,6 +310,48 @@ def print_risk_comparison(conn: sqlite3.Connection, args: argparse.Namespace, ma
         )
 
     Console(width=140).print(table)
+
+
+def print_all_strategies_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    summaries = []
+    for strategy in STRATEGIES:
+        summary = run_backtest(
+            conn=conn,
+            strategy=strategy,
+            markets=markets,
+            days=args.days,
+            interval=args.interval,
+            trade_notional_krw=args.trade_notional_krw,
+            fee_rate=args.fee_rate,
+            min_signal_gap_minutes=args.min_signal_gap_minutes,
+            bollinger_period=args.bollinger_period,
+            bollinger_stddev=args.bollinger_stddev,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+        )
+        summaries.append(summary)
+
+    summaries.sort(key=lambda summary: summary["return_pct"], reverse=True)
+
+    table = Table(title="Strategy Family Comparison")
+    table.add_column("strategy")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for summary in summaries:
+        table.add_row(
+            summary["strategy"],
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_optional_float(summary["average_hold_minutes"]),
+            format_float(summary["max_drawdown_pct"]),
+        )
+
+    Console(width=120).print(table)
 
 
 def print_market_breakdown(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
@@ -526,6 +579,12 @@ def strategy_signals(
         return ema_signals(candles)
     if strategy == "bollinger":
         return bollinger_signals(candles, period=bollinger_period, stddev=bollinger_stddev)
+    if strategy == "rsi":
+        return rsi_signals(candles)
+    if strategy == "ema_rsi":
+        return ema_rsi_signals(candles)
+    if strategy == "donchian":
+        return donchian_signals(candles)
     raise ValueError(f"Unsupported strategy: {strategy}")
 
 
@@ -549,6 +608,88 @@ def ema_signals(candles: list[Candle]) -> list[dict[str, Any]]:
         elif previous_fast >= previous_slow and current_fast < current_slow:
             signals.append(signal_event(candles[index], "SELL"))
     return signals
+
+
+def rsi_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    rsi = rsi_series(prices, RSI_PERIOD)
+    signals = []
+    for index, value in enumerate(rsi):
+        if value is None:
+            continue
+        if value < RSI_BUY_THRESHOLD:
+            signals.append(signal_event(candles[index], "BUY"))
+        elif value > RSI_SELL_THRESHOLD:
+            signals.append(signal_event(candles[index], "SELL"))
+    return signals
+
+
+def ema_rsi_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    ema_fast = ema_series(prices, EMA_FAST)
+    ema_slow = ema_series(prices, EMA_SLOW)
+    rsi = rsi_series(prices, RSI_PERIOD)
+    signals = []
+    for index in range(len(candles)):
+        current_fast = ema_fast[index]
+        current_slow = ema_slow[index]
+        current_rsi = rsi[index]
+        if None in (current_fast, current_slow, current_rsi):
+            continue
+        if current_fast > current_slow and current_rsi > EMA_RSI_BUY_THRESHOLD:
+            signals.append(signal_event(candles[index], "BUY"))
+        elif current_fast < current_slow or current_rsi < EMA_RSI_SELL_THRESHOLD:
+            signals.append(signal_event(candles[index], "SELL"))
+    return signals
+
+
+def donchian_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    signals = []
+    start_index = max(DONCHIAN_ENTRY_CHANNEL, DONCHIAN_EXIT_CHANNEL)
+    for index in range(start_index, len(candles)):
+        entry_high = max(prices[index - DONCHIAN_ENTRY_CHANNEL:index])
+        exit_low = min(prices[index - DONCHIAN_EXIT_CHANNEL:index])
+        price = prices[index]
+        if price > entry_high:
+            signals.append(signal_event(candles[index], "BUY"))
+        elif price < exit_low:
+            signals.append(signal_event(candles[index], "SELL"))
+    return signals
+
+
+def rsi_series(values: list[float], period: int) -> list[float | None]:
+    series: list[float | None] = [None] * len(values)
+    if len(values) <= period:
+        return series
+
+    gains = []
+    losses = []
+    for index in range(1, period + 1):
+        change = values[index] - values[index - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+
+    average_gain = sum(gains) / period
+    average_loss = sum(losses) / period
+    series[period] = rsi_from_averages(average_gain, average_loss)
+
+    for index in range(period + 1, len(values)):
+        change = values[index] - values[index - 1]
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+        average_gain = ((average_gain * (period - 1)) + gain) / period
+        average_loss = ((average_loss * (period - 1)) + loss) / period
+        series[index] = rsi_from_averages(average_gain, average_loss)
+
+    return series
+
+
+def rsi_from_averages(average_gain: float, average_loss: float) -> float:
+    if average_loss == 0:
+        return 100.0
+    relative_strength = average_gain / average_loss
+    return 100 - (100 / (1 + relative_strength))
 
 
 def ema_series(values: list[float], period: int) -> list[float | None]:
