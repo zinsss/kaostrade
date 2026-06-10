@@ -80,7 +80,12 @@ def backfill_features_and_regimes(
         "features_existing": 0,
         "regimes_inserted": 0,
         "regimes_existing": 0,
+        "features_updated": 0,
+        "features_with_1h_count": 0,
+        "features_with_4h_count": 0,
+        "features_missing_4h_count": 0,
         "skipped_count": 0,
+        "skipped_reasons": skipped_reason_counts(),
         "first_ts": timestamps[0] if timestamps else None,
         "last_ts": timestamps[-1] if timestamps else None,
     }
@@ -88,7 +93,7 @@ def backfill_features_and_regimes(
     for ts in timestamps:
         existing_feature = market_feature_by_ts(conn, ts, BACKFILL_SOURCE)
         if existing_feature is None:
-            features = historical_features(conn, markets, ts, tolerance_minutes)
+            features = historical_features(conn, markets, ts, tolerance_minutes, summary["skipped_reasons"])
             if features is None:
                 summary["skipped_count"] += 1
                 continue
@@ -98,6 +103,19 @@ def backfill_features_and_regimes(
             summary["features_inserted"] += 1
         else:
             features = dict(existing_feature)
+            if missing_4h_features(features):
+                refreshed_features = historical_features(conn, markets, ts, tolerance_minutes, summary["skipped_reasons"])
+                if refreshed_features is not None:
+                    update_market_feature_4h(conn, features["id"], refreshed_features)
+                    conn.commit()
+                    features.update(
+                        {
+                            "btc_return_4h": refreshed_features.get("btc_return_4h"),
+                            "eth_return_4h": refreshed_features.get("eth_return_4h"),
+                            "median_return_4h": refreshed_features.get("median_return_4h"),
+                        }
+                    )
+                    summary["features_updated"] += 1
             summary["features_existing"] += 1
 
         if market_regime_by_ts(conn, ts, BACKFILL_SOURCE) is not None:
@@ -123,7 +141,37 @@ def backfill_features_and_regimes(
         conn.commit()
         summary["regimes_inserted"] += 1
 
+    summary.update(feature_coverage_counts(conn, BACKFILL_SOURCE))
+    summary["skipped_reasons"] = {key: value for key, value in summary["skipped_reasons"].items() if value}
     return summary
+
+
+def skipped_reason_counts() -> dict[str, int]:
+    return {
+        "missing_current_candle": 0,
+        "missing_1h_reference_candle": 0,
+        "missing_4h_reference_candle": 0,
+        "tolerance_exceeded": 0,
+    }
+
+
+def feature_coverage_counts(conn: sqlite3.Connection, source: str) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN btc_return_1h IS NOT NULL OR eth_return_1h IS NOT NULL OR median_return_1h IS NOT NULL THEN 1 ELSE 0 END) AS features_with_1h_count,
+            SUM(CASE WHEN btc_return_4h IS NOT NULL OR eth_return_4h IS NOT NULL OR median_return_4h IS NOT NULL THEN 1 ELSE 0 END) AS features_with_4h_count,
+            SUM(CASE WHEN btc_return_4h IS NULL AND eth_return_4h IS NULL AND median_return_4h IS NULL THEN 1 ELSE 0 END) AS features_missing_4h_count
+        FROM market_features
+        WHERE source = ?
+        """,
+        (source,),
+    ).fetchone()
+    return {
+        "features_with_1h_count": int(row["features_with_1h_count"] or 0),
+        "features_with_4h_count": int(row["features_with_4h_count"] or 0),
+        "features_missing_4h_count": int(row["features_missing_4h_count"] or 0),
+    }
 
 
 def latest_candle_time(conn: sqlite3.Connection, markets: list[str]) -> datetime | None:
@@ -174,41 +222,74 @@ def historical_features(
     markets: list[str],
     ts: str,
     tolerance_minutes: int,
+    skipped_reasons: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
-    returns_by_market = historical_1h_returns(conn, markets, ts, tolerance_minutes)
-    returns = list(returns_by_market.values())
-    if not returns:
+    if skipped_reasons is None:
+        skipped_reasons = skipped_reason_counts()
+    returns_1h_by_market = historical_returns(
+        conn,
+        markets,
+        ts,
+        lookback_hours=1,
+        tolerance_minutes=tolerance_minutes,
+        skipped_reasons=skipped_reasons,
+    )
+    returns_4h_by_market = historical_returns(
+        conn,
+        markets,
+        ts,
+        lookback_hours=4,
+        tolerance_minutes=tolerance_minutes,
+        skipped_reasons=skipped_reasons,
+    )
+    returns_1h = list(returns_1h_by_market.values())
+    returns_4h = list(returns_4h_by_market.values())
+    if not returns_1h:
         return None
 
     return {
         "ts": ts,
         "source": BACKFILL_SOURCE,
-        "btc_return_1h": returns_by_market.get("KRW-BTC"),
-        "eth_return_1h": returns_by_market.get("KRW-ETH"),
-        "median_return_1h": median(returns),
-        "positive_ratio": positive_ratio(returns),
+        "btc_return_1h": returns_1h_by_market.get("KRW-BTC"),
+        "eth_return_1h": returns_1h_by_market.get("KRW-ETH"),
+        "median_return_1h": median(returns_1h),
+        "btc_return_4h": returns_4h_by_market.get("KRW-BTC"),
+        "eth_return_4h": returns_4h_by_market.get("KRW-ETH"),
+        "median_return_4h": median(returns_4h) if returns_4h else None,
+        "positive_ratio": positive_ratio(returns_1h),
         "average_spread_pct": None,
         "average_imbalance_5": None,
-        "market_count": len(returns),
+        "market_count": len(returns_1h),
     }
 
 
-def historical_1h_returns(
+def historical_returns(
     conn: sqlite3.Connection,
     markets: list[str],
     ts: str,
+    lookback_hours: int,
     tolerance_minutes: int,
+    skipped_reasons: dict[str, int],
 ) -> dict[str, float]:
     current_time = parse_utc_datetime(ts)
-    target_time = current_time - timedelta(hours=1)
+    target_time = current_time - timedelta(hours=lookback_hours)
+    reference_reason = f"missing_{lookback_hours}h_reference_candle"
     returns = {}
 
     for market in markets:
         current_price = exact_candle_price(conn, market, ts)
         if current_price is None or current_price <= 0:
+            skipped_reasons["missing_current_candle"] += 1
             continue
-        comparison = closest_candle_price(conn, market, target_time, tolerance_minutes)
+        comparison, reason = reference_candle_price(conn, market, target_time, tolerance_minutes)
+        if reason is not None:
+            if reason == "missing_reference_candle":
+                skipped_reasons[reference_reason] += 1
+            else:
+                skipped_reasons[reason] += 1
+            continue
         if comparison is None or comparison <= 0:
+            skipped_reasons[reference_reason] += 1
             continue
         returns[market] = (current_price - comparison) / comparison
 
@@ -231,32 +312,47 @@ def exact_candle_price(conn: sqlite3.Connection, market: str, ts: str) -> float 
     return float(row["trade_price"]) if row is not None else None
 
 
-def closest_candle_price(
+def reference_candle_price(
     conn: sqlite3.Connection,
     market: str,
     target_time: datetime,
     tolerance_minutes: int,
-) -> float | None:
-    tolerance = timedelta(minutes=tolerance_minutes)
-    rows = conn.execute(
+) -> tuple[float | None, str | None]:
+    before = conn.execute(
         """
         SELECT trade_price, candle_date_time_utc
         FROM candles
         WHERE market = ?
           AND interval = '1m'
           AND trade_price IS NOT NULL
-          AND candle_date_time_utc BETWEEN ? AND ?
+          AND candle_date_time_utc <= ?
+        ORDER BY candle_date_time_utc DESC
+        LIMIT 1
         """,
-        (
-            market,
-            format_utc(target_time - tolerance),
-            format_utc(target_time + tolerance),
-        ),
-    ).fetchall()
-    if not rows:
-        return None
-    closest = min(rows, key=lambda row: abs(parse_utc_datetime(row["candle_date_time_utc"]) - target_time))
-    return float(closest["trade_price"])
+        (market, format_utc(target_time)),
+    ).fetchone()
+    after = conn.execute(
+        """
+        SELECT trade_price, candle_date_time_utc
+        FROM candles
+        WHERE market = ?
+          AND interval = '1m'
+          AND trade_price IS NOT NULL
+          AND candle_date_time_utc >= ?
+        ORDER BY candle_date_time_utc ASC
+        LIMIT 1
+        """,
+        (market, format_utc(target_time)),
+    ).fetchone()
+    candidates = [row for row in (before, after) if row is not None]
+    if not candidates:
+        return None, "missing_reference_candle"
+
+    closest = min(candidates, key=lambda row: abs(parse_utc_datetime(row["candle_date_time_utc"]) - target_time))
+    distance = abs(parse_utc_datetime(closest["candle_date_time_utc"]) - target_time)
+    if distance > timedelta(minutes=tolerance_minutes):
+        return None, "tolerance_exceeded"
+    return float(closest["trade_price"]), None
 
 
 def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqlite3.Row | None:
@@ -269,6 +365,9 @@ def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqli
             btc_return_1h,
             eth_return_1h,
             median_return_1h,
+            btc_return_4h,
+            eth_return_4h,
+            median_return_4h,
             positive_ratio,
             average_spread_pct,
             average_imbalance_5,
@@ -280,6 +379,30 @@ def market_feature_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqli
         """,
         (ts, source),
     ).fetchone()
+
+
+def missing_4h_features(features: dict[str, Any]) -> bool:
+    return (
+        features.get("btc_return_4h") is None
+        or features.get("eth_return_4h") is None
+        or features.get("median_return_4h") is None
+    )
+
+
+def update_market_feature_4h(conn: sqlite3.Connection, feature_id: int, features: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        UPDATE market_features
+        SET btc_return_4h = ?, eth_return_4h = ?, median_return_4h = ?
+        WHERE id = ?
+        """,
+        (
+            features.get("btc_return_4h"),
+            features.get("eth_return_4h"),
+            features.get("median_return_4h"),
+            feature_id,
+        ),
+    )
 
 
 def market_regime_by_ts(conn: sqlite3.Connection, ts: str, source: str) -> sqlite3.Row | None:
@@ -305,7 +428,12 @@ def empty_summary(markets: list[str], days: int, step_minutes: int, reason: str)
         "features_existing": 0,
         "regimes_inserted": 0,
         "regimes_existing": 0,
+        "features_updated": 0,
+        "features_with_1h_count": 0,
+        "features_with_4h_count": 0,
+        "features_missing_4h_count": 0,
         "skipped_count": 0,
+        "skipped_reasons": skipped_reason_counts(),
         "first_ts": None,
         "last_ts": None,
         "skipped_reason": reason,
