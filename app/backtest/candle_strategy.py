@@ -22,6 +22,7 @@ DEFAULT_FEE_RATE = 0.0005
 DEFAULT_MIN_SIGNAL_GAP_MINUTES = 0
 DEFAULT_TAKE_PROFIT_PCT = 0.0
 DEFAULT_STOP_LOSS_PCT = 0.0
+DEFAULT_WALK_FORWARD_WINDOW_DAYS = 10
 RISK_SWEEP_TAKE_PROFIT_PCTS = (0.0, 0.5, 1.0, 1.5)
 RISK_SWEEP_STOP_LOSS_PCTS = (0.0, 0.5, 1.0)
 STRATEGIES = (
@@ -86,6 +87,9 @@ def main() -> None:
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
             return
+        if args.walk_forward:
+            print_walk_forward(conn, args, markets)
+            return
         if args.breakdown_by_market:
             print_market_breakdown(conn, args, markets)
             return
@@ -126,11 +130,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-loss-pct", type=non_negative_float, default=DEFAULT_STOP_LOSS_PCT)
     parser.add_argument("--rsi-buy-threshold", type=non_negative_float, default=DEFAULT_RSI_BUY_THRESHOLD)
     parser.add_argument("--rsi-sell-threshold", type=non_negative_float, default=DEFAULT_RSI_SELL_THRESHOLD)
+    parser.add_argument("--walk-forward-window-days", type=positive_int, default=DEFAULT_WALK_FORWARD_WINDOW_DAYS)
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--compare-bollinger", action="store_true")
     parser.add_argument("--compare-risk", action="store_true")
     parser.add_argument("--compare-all-strategies", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
+    parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--breakdown-by-market", action="store_true")
     return parser.parse_args()
 
@@ -429,6 +435,83 @@ def print_rsi_comparison(conn: sqlite3.Connection, args: argparse.Namespace, mar
     Console(width=120).print(table)
 
 
+def print_walk_forward(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    windows = walk_forward_windows(args.days, args.walk_forward_window_days)
+    summaries = []
+    for window_start, window_end in windows:
+        summary = run_backtest(
+            conn=conn,
+            strategy=args.strategy,
+            markets=markets,
+            days=args.days,
+            interval=args.interval,
+            trade_notional_krw=args.trade_notional_krw,
+            fee_rate=args.fee_rate,
+            min_signal_gap_minutes=args.min_signal_gap_minutes,
+            bollinger_period=args.bollinger_period,
+            bollinger_stddev=args.bollinger_stddev,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            rsi_buy_threshold=args.rsi_buy_threshold,
+            rsi_sell_threshold=args.rsi_sell_threshold,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        summary["window_start"] = format_utc(window_start)
+        summary["window_end"] = format_utc(window_end)
+        summaries.append(summary)
+
+    table = Table(title="Walk-Forward Backtest")
+    table.add_column("window_start")
+    table.add_column("window_end")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for summary in summaries:
+        table.add_row(
+            summary["window_start"],
+            summary["window_end"],
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_float(summary["max_drawdown_pct"]),
+        )
+
+    returns = [float(summary["return_pct"]) for summary in summaries]
+    summary_table = Table(title="Walk-Forward Summary")
+    summary_table.add_column("average_return_pct", justify="right")
+    summary_table.add_column("positive_window_count", justify="right")
+    summary_table.add_column("negative_window_count", justify="right")
+    summary_table.add_column("worst_window_return_pct", justify="right")
+    summary_table.add_column("best_window_return_pct", justify="right")
+    summary_table.add_row(
+        format_float(sum(returns) / len(returns)) if returns else "-",
+        str(sum(1 for value in returns if value > 0)),
+        str(sum(1 for value in returns if value < 0)),
+        format_float(min(returns)) if returns else "-",
+        format_float(max(returns)) if returns else "-",
+    )
+
+    console = Console(width=140)
+    console.print(table)
+    console.print(summary_table)
+
+
+def walk_forward_windows(days: int, window_days: int) -> list[tuple[datetime, datetime]]:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    window_delta = timedelta(days=window_days)
+    windows = []
+    current_start = start
+    while current_start < end:
+        current_end = min(current_start + window_delta, end)
+        windows.append((current_start, current_end))
+        current_start = current_end
+    return windows
+
+
 def print_market_breakdown(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
     summaries = []
     for market in markets:
@@ -493,6 +576,8 @@ def run_backtest(
     stop_loss_pct: float,
     rsi_buy_threshold: float,
     rsi_sell_threshold: float,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> dict[str, Any]:
     cash = START_CASH_KRW
     positions: dict[str, Position] = {}
@@ -509,7 +594,7 @@ def run_backtest(
     latest_prices: dict[str, float] = {}
 
     candles_by_market = {
-        market: load_candles(conn, market, interval, days)
+        market: load_candles(conn, market, interval, days, window_start=window_start, window_end=window_end)
         for market in markets
     }
     signals_by_market = {
@@ -592,7 +677,7 @@ def run_backtest(
             }
         )
 
-    final_prices = final_market_prices(conn, markets, interval, days)
+    final_prices = final_market_prices(conn, markets, interval, days, window_start=window_start, window_end=window_end)
     latest_prices.update(final_prices)
     final_equity = estimate_equity(cash, positions, latest_prices)
 
@@ -606,6 +691,8 @@ def run_backtest(
         "stop_loss_pct": stop_loss_pct,
         "rsi_buy_threshold": rsi_buy_threshold,
         "rsi_sell_threshold": rsi_sell_threshold,
+        "window_start": format_utc(window_start) if window_start is not None else None,
+        "window_end": format_utc(window_end) if window_end is not None else None,
         "raw_signal_count": raw_signal_count,
         "accepted_signal_count": accepted_signal_count,
         "skipped_signal_count": raw_signal_count - accepted_signal_count,
@@ -626,19 +713,32 @@ def run_backtest(
     }
 
 
-def load_candles(conn: sqlite3.Connection, market: str, interval: str, days: int) -> list[Candle]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+def load_candles(
+    conn: sqlite3.Connection,
+    market: str,
+    interval: str,
+    days: int,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> list[Candle]:
+    cutoff = window_start or (datetime.now(timezone.utc) - timedelta(days=days))
+    params: list[Any] = [market, interval, format_utc(cutoff)]
+    upper_bound_sql = ""
+    if window_end is not None:
+        upper_bound_sql = "AND candle_date_time_utc < ?"
+        params.append(format_utc(window_end))
     rows = conn.execute(
-        """
+        f"""
         SELECT candle_date_time_utc, trade_price
         FROM candles
         WHERE market = ?
           AND interval = ?
           AND candle_date_time_utc >= ?
+          {upper_bound_sql}
           AND trade_price IS NOT NULL
         ORDER BY candle_date_time_utc ASC, id ASC
         """,
-        (market, interval, format_utc(cutoff)),
+        params,
     ).fetchall()
 
     candles = []
@@ -912,10 +1012,17 @@ def filter_signals_by_gap(signals: list[dict[str, Any]], min_signal_gap_minutes:
     return accepted
 
 
-def final_market_prices(conn: sqlite3.Connection, markets: list[str], interval: str, days: int) -> dict[str, float]:
+def final_market_prices(
+    conn: sqlite3.Connection,
+    markets: list[str],
+    interval: str,
+    days: int,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> dict[str, float]:
     prices = {}
     for market in markets:
-        candles = load_candles(conn, market, interval, days)
+        candles = load_candles(conn, market, interval, days, window_start=window_start, window_end=window_end)
         if candles:
             prices[market] = candles[-1].price
     return prices
