@@ -34,6 +34,10 @@ HOLD_TP_TAKE_PROFIT_PCTS = (0.5, 1.0, 2.0, 3.0, 5.0)
 HOLD_TP_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
 HOLD_TP_STRATEGY = "bollinger_rsi_and_mtf"
 HOLD_TP_BASELINE_LABEL = "candidate_v1_baseline"
+DYNAMIC_UNIVERSE_MAX_HOLD_HOURS = (None, 6, 12, 24, 48, 72)
+DYNAMIC_UNIVERSE_TAKE_PROFIT_PCTS = (0.5, 1.0, 2.0, 3.0)
+DYNAMIC_UNIVERSE_LOOKBACK_DAYS = 7
+DYNAMIC_UNIVERSE_MARKET_COUNT = 3
 STRATEGIES = (
     "ema",
     "bollinger",
@@ -114,6 +118,9 @@ def main() -> None:
         if args.compare_hold_tp:
             print_hold_tp_comparison(conn)
             return
+        if args.compare_dynamic_universe_hold:
+            print_dynamic_universe_hold_comparison(conn, config)
+            return
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
             return
@@ -171,6 +178,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-market-subsets", action="store_true")
     parser.add_argument("--compare-fees", action="store_true")
     parser.add_argument("--compare-hold-tp", action="store_true")
+    parser.add_argument("--compare-dynamic-universe-hold", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--json-report", action="store_true")
@@ -1023,42 +1031,57 @@ def run_hold_tp_baseline_summary(window_inputs: list[dict[str, Any]]) -> dict[st
     )
 
 
-def hold_tp_window_inputs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def hold_tp_window_inputs(
+    conn: sqlite3.Connection,
+    windows: list[tuple[datetime, datetime]] | None = None,
+) -> list[dict[str, Any]]:
     args = hold_tp_baseline_args()
-    window_inputs = []
-    for window_start, window_end in walk_forward_windows(args.days, args.walk_forward_window_days):
-        candles_by_market = {
-            market: load_candles(conn, market, args.interval, args.days, window_start=window_start, window_end=window_end)
-            for market in HOLD_TP_MARKETS
-        }
-        raw_signals_by_market = {
-            market: strategy_signals(
-                args.strategy,
-                candles,
-                bollinger_period=args.bollinger_period,
-                bollinger_stddev=args.bollinger_stddev,
-                rsi_buy_threshold=args.rsi_buy_threshold,
-                rsi_sell_threshold=args.rsi_sell_threshold,
-            )
+    selected_windows = windows or walk_forward_windows(args.days, args.walk_forward_window_days)
+    return [
+        build_hold_tp_window_input(conn, args, list(HOLD_TP_MARKETS), window_start, window_end)
+        for window_start, window_end in selected_windows
+    ]
+
+
+def build_hold_tp_window_input(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    markets: list[str],
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, Any]:
+    candles_by_market = {
+        market: load_candles(conn, market, args.interval, args.days, window_start=window_start, window_end=window_end)
+        for market in markets
+    }
+    raw_signals_by_market = {
+        market: strategy_signals(
+            args.strategy,
+            candles,
+            bollinger_period=args.bollinger_period,
+            bollinger_stddev=args.bollinger_stddev,
+            rsi_buy_threshold=args.rsi_buy_threshold,
+            rsi_sell_threshold=args.rsi_sell_threshold,
+        )
+        for market, candles in candles_by_market.items()
+    }
+    signals_by_market = {
+        market: filter_signals_by_gap(signals, args.min_signal_gap_minutes)
+        for market, signals in raw_signals_by_market.items()
+    }
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "markets": markets,
+        "events": build_price_events(candles_by_market, signals_by_market),
+        "final_prices": {
+            market: candles[-1].price
             for market, candles in candles_by_market.items()
-        }
-        signals_by_market = {
-            market: filter_signals_by_gap(signals, args.min_signal_gap_minutes)
-            for market, signals in raw_signals_by_market.items()
-        }
-        window_inputs.append({
-            "window_start": window_start,
-            "window_end": window_end,
-            "events": build_price_events(candles_by_market, signals_by_market),
-            "final_prices": {
-                market: candles[-1].price
-                for market, candles in candles_by_market.items()
-                if candles
-            },
-            "raw_signal_count": sum(len(signals) for signals in raw_signals_by_market.values()),
-            "accepted_signal_count": sum(len(signals) for signals in signals_by_market.values()),
-        })
-    return window_inputs
+            if candles
+        },
+        "raw_signal_count": sum(len(signals) for signals in raw_signals_by_market.values()),
+        "accepted_signal_count": sum(len(signals) for signals in signals_by_market.values()),
+    }
 
 
 def run_hold_tp_window_summary(window_input: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -1146,7 +1169,7 @@ def run_hold_tp_window_summary(window_input: dict[str, Any], args: argparse.Name
     raw_signal_count = window_input["raw_signal_count"]
     return {
         "strategy": args.strategy,
-        "markets": list(HOLD_TP_MARKETS),
+        "markets": window_input.get("markets", list(HOLD_TP_MARKETS)),
         "min_signal_gap_minutes": args.min_signal_gap_minutes,
         "bollinger_period": args.bollinger_period,
         "bollinger_stddev": args.bollinger_stddev,
@@ -1210,6 +1233,8 @@ def summarize_hold_tp_result(
     max_hold_hours: int | None,
     take_profit_pct: float,
     summaries: list[dict[str, Any]],
+    universe_mode: str = "fixed",
+    selected_markets_by_window: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     walk_forward_summary = summarize_walk_forward(summaries)
     average_hold_values = [
@@ -1219,6 +1244,7 @@ def summarize_hold_tp_result(
     ]
     return {
         "label": label,
+        "universe_mode": universe_mode,
         "max_hold_hours": max_hold_hours,
         "take_profit_pct": take_profit_pct,
         "average_return_pct": walk_forward_summary["average_return_pct"],
@@ -1233,6 +1259,7 @@ def summarize_hold_tp_result(
         "signal_exit_count": sum(int(summary["signal_exit_count"]) for summary in summaries),
         "take_profit_count": sum(int(summary["take_profit_count"]) for summary in summaries),
         "average_hold_minutes": mean(average_hold_values) if average_hold_values else None,
+        "selected_markets_by_window": selected_markets_by_window or fixed_selected_markets_by_window(summaries),
     }
 
 
@@ -1252,6 +1279,201 @@ def hold_tp_sort_key(row: dict[str, Any]) -> tuple[float, int, float]:
         -int(row["positive_window_count"]),
         float(max_drawdown_pct) if max_drawdown_pct is not None else float("inf"),
     )
+
+
+def print_dynamic_universe_hold_comparison(conn: sqlite3.Connection, config: dict[str, Any]) -> None:
+    markets = configured_markets_with_candles(conn, configured_markets(config))
+    if not markets:
+        raise ValueError("No configured markets have candle data")
+
+    rows = dynamic_universe_hold_rows(conn, markets)
+
+    table = Table(title="Dynamic Universe Hold/Take-Profit Walk-Forward Sweep")
+    table.add_column("label", no_wrap=True)
+    table.add_column("universe_mode", no_wrap=True)
+    table.add_column("max_hold_hours", no_wrap=True, justify="right")
+    table.add_column("take_profit_pct", no_wrap=True, justify="right")
+    table.add_column("average_return_pct", no_wrap=True, justify="right")
+    table.add_column("median_return_pct", no_wrap=True, justify="right")
+    table.add_column("positive_window_count", no_wrap=True, justify="right")
+    table.add_column("negative_window_count", no_wrap=True, justify="right")
+    table.add_column("worst_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("best_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("max_drawdown_pct", no_wrap=True, justify="right")
+    table.add_column("trade_count", no_wrap=True, justify="right")
+    table.add_column("selected_markets_by_window")
+
+    for row in rows:
+        table.add_row(
+            row["label"],
+            row["universe_mode"],
+            format_max_hold_hours(row["max_hold_hours"]),
+            format_float(row["take_profit_pct"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            str(row["trade_count"]),
+            format_selected_markets_by_window(row["selected_markets_by_window"]),
+        )
+
+    Console(width=320).print(table)
+
+
+def dynamic_universe_hold_rows(conn: sqlite3.Connection, markets: list[str]) -> list[dict[str, Any]]:
+    args = hold_tp_baseline_args()
+    windows = walk_forward_windows(args.days, args.walk_forward_window_days)
+    fixed_window_inputs = hold_tp_window_inputs(conn, windows)
+    dynamic_window_inputs = dynamic_universe_window_inputs(conn, markets, windows)
+    rows = [
+        with_universe_mode(run_hold_tp_baseline_summary(fixed_window_inputs), "fixed", "fixed_candidate_v1"),
+        with_universe_mode(run_hold_tp_summary(fixed_window_inputs, 6, 2.0), "fixed", "fixed_best_hold_6h_tp_2"),
+        run_dynamic_universe_summary(dynamic_window_inputs, None, 0.5, "dynamic_candidate_v1"),
+    ]
+    sweep_rows = [
+        run_dynamic_universe_summary(dynamic_window_inputs, max_hold_hours, take_profit_pct)
+        for max_hold_hours in DYNAMIC_UNIVERSE_MAX_HOLD_HOURS
+        for take_profit_pct in DYNAMIC_UNIVERSE_TAKE_PROFIT_PCTS
+    ]
+    return rows + sort_dynamic_universe_rows(sweep_rows)
+
+
+def run_dynamic_universe_summary(
+    window_inputs: list[dict[str, Any]],
+    max_hold_hours: int | None,
+    take_profit_pct: float,
+    label: str | None = None,
+) -> dict[str, Any]:
+    args = hold_tp_baseline_args()
+    args.max_hold_hours = max_hold_hours
+    args.take_profit_pct = take_profit_pct
+    summaries = [run_hold_tp_window_summary(window_input, args) for window_input in window_inputs]
+    return summarize_hold_tp_result(
+        label or f"dynamic_hold_{format_max_hold_hours(max_hold_hours)}_tp_{take_profit_pct:g}",
+        max_hold_hours,
+        take_profit_pct,
+        summaries,
+        universe_mode="dynamic_top3_prior_7d",
+        selected_markets_by_window=selected_markets_by_window(window_inputs),
+    )
+
+
+def with_universe_mode(row: dict[str, Any], universe_mode: str, label: str) -> dict[str, Any]:
+    updated = dict(row)
+    updated["label"] = label
+    updated["universe_mode"] = universe_mode
+    return updated
+
+
+def dynamic_universe_window_inputs(
+    conn: sqlite3.Connection,
+    markets: list[str],
+    windows: list[tuple[datetime, datetime]] | None = None,
+) -> list[dict[str, Any]]:
+    args = hold_tp_baseline_args()
+    selected_windows = windows or walk_forward_windows(args.days, args.walk_forward_window_days)
+    window_inputs = []
+    for window_start, window_end in selected_windows:
+        selected_markets = rank_dynamic_universe_markets(conn, markets, window_start)[:DYNAMIC_UNIVERSE_MARKET_COUNT]
+        window_inputs.append(build_hold_tp_window_input(conn, args, selected_markets, window_start, window_end))
+    return window_inputs
+
+
+def rank_dynamic_universe_markets(
+    conn: sqlite3.Connection,
+    markets: list[str],
+    window_start: datetime,
+) -> list[str]:
+    returns = []
+    for market in markets:
+        prior_return = prior_market_return(conn, market, window_start, DYNAMIC_UNIVERSE_LOOKBACK_DAYS)
+        if prior_return is not None:
+            returns.append((market, prior_return))
+    returns.sort(key=lambda item: item[1], reverse=True)
+    return [market for market, _ in returns]
+
+
+def prior_market_return(
+    conn: sqlite3.Connection,
+    market: str,
+    window_start: datetime,
+    lookback_days: int,
+) -> float | None:
+    current_price = candle_price_at_or_before(conn, market, window_start)
+    reference_price = candle_price_at_or_before(conn, market, window_start - timedelta(days=lookback_days))
+    if current_price is None or reference_price is None or reference_price <= 0:
+        return None
+    return (current_price - reference_price) / reference_price
+
+
+def candle_price_at_or_before(conn: sqlite3.Connection, market: str, ts: datetime) -> float | None:
+    row = conn.execute(
+        """
+        SELECT trade_price
+        FROM candles
+        WHERE market = ?
+          AND interval = '1m'
+          AND candle_date_time_utc <= ?
+          AND trade_price IS NOT NULL
+        ORDER BY candle_date_time_utc DESC, id DESC
+        LIMIT 1
+        """,
+        (market, format_utc(ts)),
+    ).fetchone()
+    return float(row["trade_price"]) if row else None
+
+
+def configured_markets_with_candles(conn: sqlite3.Connection, markets: list[str]) -> list[str]:
+    available = []
+    for market in markets:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM candles
+            WHERE market = ?
+              AND interval = '1m'
+              AND trade_price IS NOT NULL
+            LIMIT 1
+            """,
+            (market,),
+        ).fetchone()
+        if row:
+            available.append(market)
+    return available
+
+
+def selected_markets_by_window(window_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "window_start": format_utc(window_input["window_start"]),
+            "markets": list(window_input.get("markets", [])),
+        }
+        for window_input in window_inputs
+    ]
+
+
+def fixed_selected_markets_by_window(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "window_start": summary["window_start"],
+            "markets": list(summary.get("markets", HOLD_TP_MARKETS)),
+        }
+        for summary in summaries
+    ]
+
+
+def format_selected_markets_by_window(values: list[dict[str, Any]]) -> str:
+    return "; ".join(
+        f"{item['window_start']}={','.join(item['markets'])}"
+        for item in values
+    )
+
+
+def sort_dynamic_universe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=hold_tp_sort_key)
 
 
 def print_market_subset_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
