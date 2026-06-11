@@ -12,6 +12,7 @@ from app.backtest.strategy_profiles import get_strategy_profile
 from app.backtest.candle_strategy import (
     Candle,
     FEE_SWEEP_RATES,
+    FIXED_UNIVERSE_MARKETS,
     HOLD_TP_BASELINE_LABEL,
     HOLD_TP_MARKETS,
     Position,
@@ -23,10 +24,13 @@ from app.backtest.candle_strategy import (
     build_walk_forward_report,
     candle_price_at_or_before,
     configured_markets_with_candles,
+    fixed_universe_args,
+    fixed_universes,
     classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
     main,
+    merge_fixed_universe_window_input,
     parse_args,
     hold_tp_baseline_args,
     hold_tp_sweep_args,
@@ -34,9 +38,11 @@ from app.backtest.candle_strategy import (
     rank_dynamic_universe_markets,
     market_subsets,
     risk_exit_for_position,
+    sort_fixed_universe_rows,
     sort_hold_tp_rows,
     sort_market_subset_rows,
     summarize_fee_sensitivity,
+    summarize_fixed_universe,
     summarize_hold_tp_result,
     summarize_market_subset,
     run_dynamic_universe_summary,
@@ -821,6 +827,125 @@ class DynamicUniverseHoldSweepTests(unittest.TestCase):
         self.assertEqual(summary["take_profit_pct"], 0.5)
         self.assertEqual(summary["selected_markets_by_window"], [
             {"window_start": "2026-01-01T00:00:00", "markets": ["KRW-SOL", "KRW-XRP", "KRW-BTC"]}
+        ])
+
+
+class FixedUniverseComparisonTests(unittest.TestCase):
+    def test_fixed_universes_include_requested_single_pair_and_triple_sets(self) -> None:
+        universes = fixed_universes()
+
+        self.assertEqual(FIXED_UNIVERSE_MARKETS, ("KRW-BTC", "KRW-SOL", "KRW-DOGE", "KRW-ETH", "KRW-XRP"))
+        self.assertEqual(len(universes), 25)
+        self.assertEqual(universes[:5], [
+            ["KRW-BTC"],
+            ["KRW-SOL"],
+            ["KRW-DOGE"],
+            ["KRW-ETH"],
+            ["KRW-XRP"],
+        ])
+        self.assertIn(["KRW-BTC", "KRW-SOL"], universes)
+        self.assertIn(["KRW-ETH", "KRW-XRP"], universes)
+        self.assertIn(["KRW-BTC", "KRW-SOL", "KRW-DOGE"], universes)
+        self.assertIn(["KRW-DOGE", "KRW-ETH", "KRW-XRP"], universes)
+
+    def test_fixed_universe_args_use_candidate_v1_exits(self) -> None:
+        args = fixed_universe_args()
+        profile = get_strategy_profile("candidate_v1")
+
+        self.assertEqual(args.strategy, "bollinger_rsi_and_mtf")
+        self.assertEqual(args.days, 180)
+        self.assertEqual(args.walk_forward_window_days, 30)
+        self.assertEqual(args.bollinger_period, profile["bollinger_period"])
+        self.assertEqual(args.bollinger_stddev, profile["bollinger_stddev"])
+        self.assertEqual(args.rsi_buy_threshold, profile["rsi_buy_threshold"])
+        self.assertEqual(args.rsi_sell_threshold, profile["rsi_sell_threshold"])
+        self.assertEqual(args.take_profit_pct, 0.5)
+        self.assertEqual(args.stop_loss_pct, 0)
+        self.assertIsNone(args.max_hold_hours)
+
+    def test_summarize_fixed_universe_uses_requested_output_fields(self) -> None:
+        summary = summarize_fixed_universe(
+            ["KRW-BTC", "KRW-SOL"],
+            [
+                window_summary("a", "b", 1.0, 2, 0.3),
+                window_summary("b", "c", -0.5, 4, 0.8),
+                window_summary("c", "d", 0.2, 6, 0.1),
+            ],
+        )
+
+        self.assertEqual(summary["markets"], ["KRW-BTC", "KRW-SOL"])
+        self.assertEqual(summary["market_count"], 2)
+        self.assertEqual(summary["trade_count"], 12)
+        self.assertAlmostEqual(summary["average_return_pct"], (1.0 - 0.5 + 0.2) / 3)
+        self.assertEqual(summary["median_return_pct"], 0.2)
+        self.assertEqual(summary["positive_window_count"], 2)
+        self.assertEqual(summary["negative_window_count"], 1)
+        self.assertEqual(summary["worst_window_return_pct"], -0.5)
+        self.assertEqual(summary["best_window_return_pct"], 1.0)
+        self.assertEqual(summary["max_drawdown_pct"], 0.8)
+
+    def test_merge_fixed_universe_window_input_combines_cached_market_inputs(self) -> None:
+        single_market_inputs = {
+            "KRW-BTC": [
+                {
+                    "window_start": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "window_end": datetime(2026, 1, 2, tzinfo=timezone.utc),
+                    "markets": ["KRW-BTC"],
+                    "events": [{"ts": ts(2), "market": "KRW-BTC", "price": 100.0}],
+                    "final_prices": {"KRW-BTC": 100.0},
+                    "raw_signal_count": 2,
+                    "accepted_signal_count": 1,
+                }
+            ],
+            "KRW-SOL": [
+                {
+                    "window_start": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "window_end": datetime(2026, 1, 2, tzinfo=timezone.utc),
+                    "markets": ["KRW-SOL"],
+                    "events": [{"ts": ts(1), "market": "KRW-SOL", "price": 50.0}],
+                    "final_prices": {"KRW-SOL": 50.0},
+                    "raw_signal_count": 3,
+                    "accepted_signal_count": 2,
+                }
+            ],
+        }
+
+        merged = merge_fixed_universe_window_input(["KRW-BTC", "KRW-SOL"], single_market_inputs, 0)
+
+        self.assertEqual(merged["markets"], ["KRW-BTC", "KRW-SOL"])
+        self.assertEqual([event["market"] for event in merged["events"]], ["KRW-SOL", "KRW-BTC"])
+        self.assertEqual(merged["final_prices"], {"KRW-BTC": 100.0, "KRW-SOL": 50.0})
+        self.assertEqual(merged["raw_signal_count"], 5)
+        self.assertEqual(merged["accepted_signal_count"], 3)
+
+    def test_fixed_universe_sort_order(self) -> None:
+        rows = [
+            {
+                "markets": ["low"],
+                "average_return_pct": 0.1,
+                "positive_window_count": 3,
+                "max_drawdown_pct": 0.1,
+            },
+            {
+                "markets": ["better_positive"],
+                "average_return_pct": 0.2,
+                "positive_window_count": 4,
+                "max_drawdown_pct": 0.5,
+            },
+            {
+                "markets": ["lower_drawdown"],
+                "average_return_pct": 0.2,
+                "positive_window_count": 4,
+                "max_drawdown_pct": 0.2,
+            },
+        ]
+
+        sorted_rows = sort_fixed_universe_rows(rows)
+
+        self.assertEqual([row["markets"][0] for row in sorted_rows], [
+            "lower_drawdown",
+            "better_positive",
+            "low",
         ])
 
 
