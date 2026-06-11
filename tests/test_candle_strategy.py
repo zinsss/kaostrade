@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from app.backtest.strategy_profiles import get_strategy_profile
 from app.backtest.candle_strategy import (
     Candle,
     FEE_SWEEP_RATES,
+    HOLD_TP_BASELINE_LABEL,
+    HOLD_TP_MARKETS,
+    Position,
     apply_profile_defaults,
     aligned_mtf_trend,
     bollinger_rsi_parameter_grid,
@@ -19,9 +25,14 @@ from app.backtest.candle_strategy import (
     derive_five_minute_candles,
     main,
     parse_args,
+    hold_tp_baseline_args,
+    hold_tp_sweep_args,
     market_subsets,
+    risk_exit_for_position,
+    sort_hold_tp_rows,
     sort_market_subset_rows,
     summarize_fee_sensitivity,
+    summarize_hold_tp_result,
     summarize_market_subset,
     summarize_walk_forward,
     validate_strategy_interval,
@@ -96,6 +107,9 @@ def window_summary(
         "total_fees_krw": float(trade_count) * 5.0,
         "max_drawdown_pct": max_drawdown_pct,
         "average_hold_minutes": 12.5 if trade_count else None,
+        "forced_exit_count": 0,
+        "signal_exit_count": trade_count // 2,
+        "take_profit_count": 1 if trade_count else 0,
     }
 
 
@@ -570,6 +584,152 @@ class FeeSensitivitySweepTests(unittest.TestCase):
         self.assertEqual(summary["positive_window_count"], 2)
         self.assertEqual(summary["negative_window_count"], 1)
         self.assertEqual(summary["max_drawdown_pct"], 0.5)
+
+
+class HoldTakeProfitSweepTests(unittest.TestCase):
+    def test_candidate_v1_baseline_args_match_existing_profile(self) -> None:
+        args = hold_tp_baseline_args()
+        profile = get_strategy_profile("candidate_v1")
+
+        self.assertEqual(HOLD_TP_BASELINE_LABEL, "candidate_v1_baseline")
+        self.assertEqual(HOLD_TP_MARKETS, tuple(profile["markets"]))
+        self.assertEqual(args.strategy, profile["strategy"])
+        self.assertEqual(args.days, profile["days"])
+        self.assertEqual(args.walk_forward_window_days, profile["walk_forward_window_days"])
+        self.assertEqual(args.bollinger_period, profile["bollinger_period"])
+        self.assertEqual(args.bollinger_stddev, profile["bollinger_stddev"])
+        self.assertEqual(args.rsi_buy_threshold, profile["rsi_buy_threshold"])
+        self.assertEqual(args.rsi_sell_threshold, profile["rsi_sell_threshold"])
+        self.assertEqual(args.take_profit_pct, profile["take_profit_pct"])
+        self.assertEqual(args.stop_loss_pct, profile["stop_loss_pct"])
+        self.assertEqual(args.min_signal_gap_minutes, profile["min_signal_gap_minutes"])
+        self.assertIsNone(args.max_hold_hours)
+
+    def test_hold_tp_sweep_args_use_candidate_v2_research_settings(self) -> None:
+        args = hold_tp_sweep_args(max_hold_hours=12, take_profit_pct=2.0)
+
+        self.assertEqual(args.strategy, "bollinger_rsi_and_mtf")
+        self.assertEqual(HOLD_TP_MARKETS, ("KRW-BTC", "KRW-SOL", "KRW-DOGE"))
+        self.assertEqual(args.days, 180)
+        self.assertEqual(args.walk_forward_window_days, 30)
+        self.assertEqual(args.bollinger_period, 10)
+        self.assertEqual(args.bollinger_stddev, 2.0)
+        self.assertEqual(args.rsi_buy_threshold, 20.0)
+        self.assertEqual(args.rsi_sell_threshold, 65.0)
+        self.assertEqual(args.take_profit_pct, 2.0)
+        self.assertEqual(args.stop_loss_pct, 0.0)
+        self.assertEqual(args.min_signal_gap_minutes, 60)
+        self.assertEqual(args.max_hold_hours, 12)
+
+    def test_max_hold_none_does_not_force_exit(self) -> None:
+        position = Position(quantity=1.0, average_entry_price=100.0, entry_ts=ts(0))
+
+        self.assertIsNone(
+            risk_exit_for_position(
+                position,
+                100.0,
+                ts=ts(10_000),
+                take_profit_pct=0.0,
+                stop_loss_pct=0.0,
+                max_hold_hours=None,
+            )
+        )
+
+    def test_max_hold_exit_requires_age_to_exceed_limit(self) -> None:
+        position = Position(quantity=1.0, average_entry_price=100.0, entry_ts=ts(0))
+
+        self.assertIsNone(
+            risk_exit_for_position(
+                position,
+                100.0,
+                ts=ts(360),
+                take_profit_pct=0.0,
+                stop_loss_pct=0.0,
+                max_hold_hours=6,
+            )
+        )
+        self.assertEqual(
+            risk_exit_for_position(
+                position,
+                100.0,
+                ts=ts(361),
+                take_profit_pct=0.0,
+                stop_loss_pct=0.0,
+                max_hold_hours=6,
+            ),
+            "MAX_HOLD",
+        )
+
+    def test_summarize_hold_tp_result_uses_walk_forward_metrics(self) -> None:
+        summary = summarize_hold_tp_result(
+            "hold_24h_tp_1",
+            24,
+            1.0,
+            [
+                window_summary("a", "b", 0.8, 2, 0.2),
+                window_summary("b", "c", -0.1, 4, 0.5),
+                window_summary("c", "d", 0.3, 6, 0.4),
+            ],
+        )
+
+        self.assertEqual(summary["label"], "hold_24h_tp_1")
+        self.assertEqual(summary["max_hold_hours"], 24)
+        self.assertEqual(summary["take_profit_pct"], 1.0)
+        self.assertAlmostEqual(summary["average_return_pct"], (0.8 - 0.1 + 0.3) / 3)
+        self.assertEqual(summary["median_return_pct"], 0.3)
+        self.assertEqual(summary["positive_window_count"], 2)
+        self.assertEqual(summary["negative_window_count"], 1)
+        self.assertEqual(summary["worst_window_return_pct"], -0.1)
+        self.assertEqual(summary["best_window_return_pct"], 0.8)
+        self.assertEqual(summary["max_drawdown_pct"], 0.5)
+        self.assertEqual(summary["trade_count"], 12)
+        self.assertEqual(summary["forced_exit_count"], 0)
+        self.assertEqual(summary["signal_exit_count"], 6)
+        self.assertEqual(summary["take_profit_count"], 3)
+        self.assertEqual(summary["average_hold_minutes"], 12.5)
+
+    def test_hold_tp_rows_sort_by_return_positive_windows_then_drawdown(self) -> None:
+        rows = [
+            {
+                "max_hold_hours": 6,
+                "take_profit_pct": 0.5,
+                "average_return_pct": 0.1,
+                "positive_window_count": 3,
+                "max_drawdown_pct": 0.1,
+                "label": "low",
+            },
+            {
+                "max_hold_hours": 12,
+                "take_profit_pct": 1.0,
+                "average_return_pct": 0.2,
+                "positive_window_count": 4,
+                "max_drawdown_pct": 0.5,
+                "label": "better_positive",
+            },
+            {
+                "max_hold_hours": 24,
+                "take_profit_pct": 2.0,
+                "average_return_pct": 0.2,
+                "positive_window_count": 4,
+                "max_drawdown_pct": 0.2,
+                "label": "lower_drawdown",
+            },
+        ]
+
+        sorted_rows = sort_hold_tp_rows(rows)
+
+        self.assertEqual([row["max_hold_hours"] for row in sorted_rows], [24, 12, 6])
+
+    def test_compare_hold_tp_does_not_import_paper_modules(self) -> None:
+        tree = ast.parse(Path("app/backtest/candle_strategy.py").read_text())
+        imported_modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module)
+
+        self.assertFalse(any(module.startswith("app.paper") for module in imported_modules))
 
 
 class MarketSubsetOptimizerTests(unittest.TestCase):

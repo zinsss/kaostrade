@@ -29,6 +29,11 @@ DEFAULT_WALK_FORWARD_WINDOW_DAYS = 10
 RISK_SWEEP_TAKE_PROFIT_PCTS = (0.0, 0.5, 1.0, 1.5)
 RISK_SWEEP_STOP_LOSS_PCTS = (0.0, 0.5, 1.0)
 FEE_SWEEP_RATES = (0.0, 0.0002, 0.0004, 0.0006, 0.0008, 0.0010)
+HOLD_TP_MAX_HOLD_HOURS = (6, 12, 24, 48, 72)
+HOLD_TP_TAKE_PROFIT_PCTS = (0.5, 1.0, 2.0, 3.0, 5.0)
+HOLD_TP_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
+HOLD_TP_STRATEGY = "bollinger_rsi_and_mtf"
+HOLD_TP_BASELINE_LABEL = "candidate_v1_baseline"
 STRATEGIES = (
     "ema",
     "bollinger",
@@ -106,6 +111,9 @@ def main() -> None:
         if args.compare_fees:
             print_fee_sensitivity_comparison(conn, args, markets)
             return
+        if args.compare_hold_tp:
+            print_hold_tp_comparison(conn)
+            return
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
             return
@@ -130,6 +138,7 @@ def main() -> None:
             stop_loss_pct=args.stop_loss_pct,
             rsi_buy_threshold=args.rsi_buy_threshold,
             rsi_sell_threshold=args.rsi_sell_threshold,
+            max_hold_hours=getattr(args, "max_hold_hours", None),
         )
 
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
@@ -161,6 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-bollinger-rsi", action="store_true")
     parser.add_argument("--compare-market-subsets", action="store_true")
     parser.add_argument("--compare-fees", action="store_true")
+    parser.add_argument("--compare-hold-tp", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--json-report", action="store_true")
@@ -811,6 +821,7 @@ def run_walk_forward_summaries(
             stop_loss_pct=args.stop_loss_pct,
             rsi_buy_threshold=args.rsi_buy_threshold,
             rsi_sell_threshold=args.rsi_sell_threshold,
+            max_hold_hours=getattr(args, "max_hold_hours", None),
             window_start=window_start,
             window_end=window_end,
         )
@@ -937,6 +948,310 @@ def summarize_fee_sensitivity(fee_rate: float, summaries: list[dict[str, Any]]) 
         "negative_window_count": walk_forward_summary["negative_window_count"],
         "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
     }
+
+def print_hold_tp_comparison(conn: sqlite3.Connection) -> None:
+    window_inputs = hold_tp_window_inputs(conn)
+    rows = sort_hold_tp_rows([
+        run_hold_tp_summary(window_inputs, max_hold_hours, take_profit_pct)
+        for max_hold_hours in HOLD_TP_MAX_HOLD_HOURS
+        for take_profit_pct in HOLD_TP_TAKE_PROFIT_PCTS
+    ])
+    rows.insert(0, run_hold_tp_baseline_summary(window_inputs))
+
+    table = Table(title="Candidate v2 Hold/Take-Profit Walk-Forward Sweep")
+    table.add_column("label", no_wrap=True)
+    table.add_column("max_hold_hours", no_wrap=True, justify="right")
+    table.add_column("take_profit_pct", no_wrap=True, justify="right")
+    table.add_column("average_return_pct", no_wrap=True, justify="right")
+    table.add_column("median_return_pct", no_wrap=True, justify="right")
+    table.add_column("positive_window_count", no_wrap=True, justify="right")
+    table.add_column("negative_window_count", no_wrap=True, justify="right")
+    table.add_column("worst_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("best_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("max_drawdown_pct", no_wrap=True, justify="right")
+    table.add_column("trade_count", no_wrap=True, justify="right")
+    table.add_column("forced_exit_count", no_wrap=True, justify="right")
+    table.add_column("signal_exit_count", no_wrap=True, justify="right")
+    table.add_column("take_profit_count", no_wrap=True, justify="right")
+    table.add_column("average_hold_minutes", no_wrap=True, justify="right")
+
+    for row in rows:
+        table.add_row(
+            row["label"],
+            format_max_hold_hours(row["max_hold_hours"]),
+            format_float(row["take_profit_pct"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            str(row["trade_count"]),
+            str(row["forced_exit_count"]),
+            str(row["signal_exit_count"]),
+            str(row["take_profit_count"]),
+            format_optional_float(row["average_hold_minutes"]),
+        )
+
+    Console(width=320).print(table)
+
+
+def run_hold_tp_summary(
+    window_inputs: list[dict[str, Any]],
+    max_hold_hours: int,
+    take_profit_pct: float,
+) -> dict[str, Any]:
+    args = hold_tp_sweep_args(max_hold_hours, take_profit_pct)
+    summaries = [run_hold_tp_window_summary(window_input, args) for window_input in window_inputs]
+    return summarize_hold_tp_result(
+        f"hold_{max_hold_hours}h_tp_{take_profit_pct:g}",
+        max_hold_hours,
+        take_profit_pct,
+        summaries,
+    )
+
+
+def run_hold_tp_baseline_summary(window_inputs: list[dict[str, Any]]) -> dict[str, Any]:
+    args = hold_tp_baseline_args()
+    summaries = [run_hold_tp_window_summary(window_input, args) for window_input in window_inputs]
+    return summarize_hold_tp_result(
+        HOLD_TP_BASELINE_LABEL,
+        None,
+        args.take_profit_pct,
+        summaries,
+    )
+
+
+def hold_tp_window_inputs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    args = hold_tp_baseline_args()
+    window_inputs = []
+    for window_start, window_end in walk_forward_windows(args.days, args.walk_forward_window_days):
+        candles_by_market = {
+            market: load_candles(conn, market, args.interval, args.days, window_start=window_start, window_end=window_end)
+            for market in HOLD_TP_MARKETS
+        }
+        raw_signals_by_market = {
+            market: strategy_signals(
+                args.strategy,
+                candles,
+                bollinger_period=args.bollinger_period,
+                bollinger_stddev=args.bollinger_stddev,
+                rsi_buy_threshold=args.rsi_buy_threshold,
+                rsi_sell_threshold=args.rsi_sell_threshold,
+            )
+            for market, candles in candles_by_market.items()
+        }
+        signals_by_market = {
+            market: filter_signals_by_gap(signals, args.min_signal_gap_minutes)
+            for market, signals in raw_signals_by_market.items()
+        }
+        window_inputs.append({
+            "window_start": window_start,
+            "window_end": window_end,
+            "events": build_price_events(candles_by_market, signals_by_market),
+            "final_prices": {
+                market: candles[-1].price
+                for market, candles in candles_by_market.items()
+                if candles
+            },
+            "raw_signal_count": sum(len(signals) for signals in raw_signals_by_market.values()),
+            "accepted_signal_count": sum(len(signals) for signals in signals_by_market.values()),
+        })
+    return window_inputs
+
+
+def run_hold_tp_window_summary(window_input: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    cash = START_CASH_KRW
+    positions: dict[str, Position] = {}
+    buy_count = 0
+    sell_count = 0
+    take_profit_count = 0
+    stop_loss_count = 0
+    signal_exit_count = 0
+    forced_exit_count = 0
+    total_fees_krw = 0.0
+    realized_pnl_krw = 0.0
+    trades: list[dict[str, Any]] = []
+    hold_minutes: list[float] = []
+    equity_curve: list[dict[str, Any]] = []
+    latest_prices: dict[str, float] = {}
+
+    for event in window_input["events"]:
+        market = event["market"]
+        ts = event["ts"]
+        price = float(event["price"])
+        latest_prices[market] = price
+        signal = event.get("signal")
+
+        risk_exit_reason = risk_exit_for_position(
+            positions.get(market),
+            price,
+            ts=ts,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            max_hold_hours=args.max_hold_hours,
+        )
+        if risk_exit_reason is not None:
+            position = positions.pop(market)
+            cash, realized_delta, fee_krw, trade = close_position(
+                cash, position, ts, market, price, args.fee_rate, risk_exit_reason
+            )
+            realized_pnl_krw += realized_delta
+            total_fees_krw += fee_krw
+            sell_count += 1
+            if risk_exit_reason == "TAKE_PROFIT":
+                take_profit_count += 1
+            elif risk_exit_reason == "STOP_LOSS":
+                stop_loss_count += 1
+            elif risk_exit_reason == "MAX_HOLD":
+                forced_exit_count += 1
+            hold_minutes.append(position_hold_minutes(position, ts))
+            trades.append(trade)
+        elif signal == "BUY" and market not in positions:
+            total_cost = args.trade_notional_krw * (1 + args.fee_rate)
+            if cash >= total_cost:
+                quantity = args.trade_notional_krw / price
+                fee_krw = args.trade_notional_krw * args.fee_rate
+                cash -= total_cost
+                positions[market] = Position(quantity=quantity, average_entry_price=price, entry_ts=ts)
+                total_fees_krw += fee_krw
+                buy_count += 1
+                trades.append(simulated_trade(ts, "BUY", market, price, quantity, args.trade_notional_krw, fee_krw, "SIGNAL"))
+        elif signal == "SELL" and market in positions:
+            position = positions.pop(market)
+            cash, realized_delta, fee_krw, trade = close_position(
+                cash, position, ts, market, price, args.fee_rate, "SIGNAL"
+            )
+            realized_pnl_krw += realized_delta
+            total_fees_krw += fee_krw
+            sell_count += 1
+            signal_exit_count += 1
+            hold_minutes.append(position_hold_minutes(position, ts))
+            trades.append(trade)
+
+        equity_curve.append(
+            {
+                "ts": ts,
+                "equity": estimate_equity(cash, positions, latest_prices),
+                "cash": cash,
+            }
+        )
+
+    latest_prices.update(window_input["final_prices"])
+    final_equity = estimate_equity(cash, positions, latest_prices)
+    window_start = window_input["window_start"]
+    window_end = window_input["window_end"]
+    accepted_signal_count = window_input["accepted_signal_count"]
+    raw_signal_count = window_input["raw_signal_count"]
+    return {
+        "strategy": args.strategy,
+        "markets": list(HOLD_TP_MARKETS),
+        "min_signal_gap_minutes": args.min_signal_gap_minutes,
+        "bollinger_period": args.bollinger_period,
+        "bollinger_stddev": args.bollinger_stddev,
+        "take_profit_pct": args.take_profit_pct,
+        "stop_loss_pct": args.stop_loss_pct,
+        "max_hold_hours": args.max_hold_hours,
+        "rsi_buy_threshold": args.rsi_buy_threshold,
+        "rsi_sell_threshold": args.rsi_sell_threshold,
+        "window_start": format_utc(window_start),
+        "window_end": format_utc(window_end),
+        "raw_signal_count": raw_signal_count,
+        "accepted_signal_count": accepted_signal_count,
+        "skipped_signal_count": raw_signal_count - accepted_signal_count,
+        "start_cash": START_CASH_KRW,
+        "final_equity": final_equity,
+        "return_pct": (final_equity - START_CASH_KRW) / START_CASH_KRW * 100,
+        "trade_count": buy_count + sell_count,
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "take_profit_count": take_profit_count,
+        "stop_loss_count": stop_loss_count,
+        "signal_exit_count": signal_exit_count,
+        "forced_exit_count": forced_exit_count,
+        "total_fees_krw": total_fees_krw,
+        "realized_pnl_krw": realized_pnl_krw,
+        "max_drawdown_pct": max_drawdown_pct(equity_curve),
+        "average_hold_minutes": average_hold_minutes(hold_minutes),
+        "trades": trades[-20:],
+    }
+
+
+def hold_tp_baseline_args() -> argparse.Namespace:
+    profile = get_strategy_profile("candidate_v1")
+    return argparse.Namespace(
+        strategy=profile["strategy"],
+        days=profile["days"],
+        interval="1m",
+        trade_notional_krw=DEFAULT_TRADE_NOTIONAL_KRW,
+        fee_rate=DEFAULT_FEE_RATE,
+        min_signal_gap_minutes=profile["min_signal_gap_minutes"],
+        bollinger_period=profile["bollinger_period"],
+        bollinger_stddev=profile["bollinger_stddev"],
+        take_profit_pct=profile["take_profit_pct"],
+        stop_loss_pct=profile["stop_loss_pct"],
+        rsi_buy_threshold=profile["rsi_buy_threshold"],
+        rsi_sell_threshold=profile["rsi_sell_threshold"],
+        walk_forward_window_days=profile["walk_forward_window_days"],
+        max_hold_hours=None,
+    )
+
+
+def hold_tp_sweep_args(max_hold_hours: int, take_profit_pct: float) -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.take_profit_pct = take_profit_pct
+    args.max_hold_hours = max_hold_hours
+    return args
+
+
+def summarize_hold_tp_result(
+    label: str,
+    max_hold_hours: int | None,
+    take_profit_pct: float,
+    summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    walk_forward_summary = summarize_walk_forward(summaries)
+    average_hold_values = [
+        float(summary["average_hold_minutes"])
+        for summary in summaries
+        if summary["average_hold_minutes"] is not None
+    ]
+    return {
+        "label": label,
+        "max_hold_hours": max_hold_hours,
+        "take_profit_pct": take_profit_pct,
+        "average_return_pct": walk_forward_summary["average_return_pct"],
+        "median_return_pct": walk_forward_summary["median_return_pct"],
+        "positive_window_count": walk_forward_summary["positive_window_count"],
+        "negative_window_count": walk_forward_summary["negative_window_count"],
+        "worst_window_return_pct": walk_forward_summary["worst_window_return_pct"],
+        "best_window_return_pct": walk_forward_summary["best_window_return_pct"],
+        "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
+        "trade_count": walk_forward_summary["total_trade_count"],
+        "forced_exit_count": sum(int(summary["forced_exit_count"]) for summary in summaries),
+        "signal_exit_count": sum(int(summary["signal_exit_count"]) for summary in summaries),
+        "take_profit_count": sum(int(summary["take_profit_count"]) for summary in summaries),
+        "average_hold_minutes": mean(average_hold_values) if average_hold_values else None,
+    }
+
+
+def sort_hold_tp_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=hold_tp_sort_key)
+
+
+def format_max_hold_hours(value: int | None) -> str:
+    return "none" if value is None else str(value)
+
+
+def hold_tp_sort_key(row: dict[str, Any]) -> tuple[float, int, float]:
+    average_return_pct = row["average_return_pct"]
+    max_drawdown_pct = row["max_drawdown_pct"]
+    return (
+        -(float(average_return_pct) if average_return_pct is not None else float("-inf")),
+        -int(row["positive_window_count"]),
+        float(max_drawdown_pct) if max_drawdown_pct is not None else float("inf"),
+    )
 
 
 def print_market_subset_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
@@ -1103,6 +1418,7 @@ def run_backtest(
     stop_loss_pct: float,
     rsi_buy_threshold: float,
     rsi_sell_threshold: float,
+    max_hold_hours: int | None = None,
     window_start: datetime | None = None,
     window_end: datetime | None = None,
 ) -> dict[str, Any]:
@@ -1115,6 +1431,7 @@ def run_backtest(
     take_profit_count = 0
     stop_loss_count = 0
     signal_exit_count = 0
+    forced_exit_count = 0
     total_fees_krw = 0.0
     realized_pnl_krw = 0.0
     trades: list[dict[str, Any]] = []
@@ -1143,7 +1460,7 @@ def run_backtest(
         for market, signals in signals_by_market.items()
     }
     accepted_signal_count = sum(len(signals) for signals in signals_by_market.values())
-    risk_controls_enabled = take_profit_pct > 0 or stop_loss_pct > 0
+    risk_controls_enabled = take_profit_pct > 0 or stop_loss_pct > 0 or max_hold_hours is not None
     events = build_price_events(candles_by_market, signals_by_market) if risk_controls_enabled else sorted(
         (event for signals in signals_by_market.values() for event in signals),
         key=lambda event: (event["ts"], event["market"]),
@@ -1159,8 +1476,10 @@ def run_backtest(
         risk_exit_reason = risk_exit_for_position(
             positions.get(market),
             price,
+            ts=ts,
             take_profit_pct=take_profit_pct,
             stop_loss_pct=stop_loss_pct,
+            max_hold_hours=max_hold_hours,
         )
         if risk_exit_reason is not None:
             position = positions.pop(market)
@@ -1174,6 +1493,8 @@ def run_backtest(
                 take_profit_count += 1
             elif risk_exit_reason == "STOP_LOSS":
                 stop_loss_count += 1
+            elif risk_exit_reason == "MAX_HOLD":
+                forced_exit_count += 1
             hold_minutes.append(position_hold_minutes(position, ts))
             trades.append(trade)
         elif signal == "BUY" and market not in positions:
@@ -1218,6 +1539,7 @@ def run_backtest(
         "bollinger_stddev": bollinger_stddev if strategy.startswith("bollinger") else None,
         "take_profit_pct": take_profit_pct,
         "stop_loss_pct": stop_loss_pct,
+        "max_hold_hours": max_hold_hours,
         "rsi_buy_threshold": rsi_buy_threshold,
         "rsi_sell_threshold": rsi_sell_threshold,
         "window_start": format_utc(window_start) if window_start is not None else None,
@@ -1234,6 +1556,7 @@ def run_backtest(
         "take_profit_count": take_profit_count,
         "stop_loss_count": stop_loss_count,
         "signal_exit_count": signal_exit_count,
+        "forced_exit_count": forced_exit_count,
         "total_fees_krw": total_fees_krw,
         "realized_pnl_krw": realized_pnl_krw,
         "max_drawdown_pct": max_drawdown_pct(equity_curve),
@@ -1651,8 +1974,10 @@ def final_market_prices(
 def risk_exit_for_position(
     position: Position | None,
     price: float,
+    ts: str,
     take_profit_pct: float,
     stop_loss_pct: float,
+    max_hold_hours: int | None = None,
 ) -> str | None:
     if position is None:
         return None
@@ -1660,6 +1985,8 @@ def risk_exit_for_position(
         return "TAKE_PROFIT"
     if stop_loss_pct > 0 and price <= position.average_entry_price * (1 - stop_loss_pct / 100):
         return "STOP_LOSS"
+    if max_hold_hours is not None and position_hold_minutes(position, ts) / 60 > max_hold_hours:
+        return "MAX_HOLD"
     return None
 
 
