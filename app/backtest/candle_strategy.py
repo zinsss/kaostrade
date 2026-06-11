@@ -27,6 +27,7 @@ DEFAULT_STOP_LOSS_PCT = 0.0
 DEFAULT_WALK_FORWARD_WINDOW_DAYS = 10
 RISK_SWEEP_TAKE_PROFIT_PCTS = (0.0, 0.5, 1.0, 1.5)
 RISK_SWEEP_STOP_LOSS_PCTS = (0.0, 0.5, 1.0)
+FEE_SWEEP_RATES = (0.0, 0.0002, 0.0004, 0.0006, 0.0008, 0.0010)
 STRATEGIES = (
     "ema",
     "bollinger",
@@ -100,6 +101,9 @@ def main() -> None:
         if args.compare_market_subsets:
             print_market_subset_comparison(conn, args, configured_markets(config))
             return
+        if args.compare_fees:
+            print_fee_sensitivity_comparison(conn, args, markets)
+            return
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
             return
@@ -153,6 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-all-strategies", action="store_true")
     parser.add_argument("--compare-bollinger-rsi", action="store_true")
     parser.add_argument("--compare-market-subsets", action="store_true")
+    parser.add_argument("--compare-fees", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--json-report", action="store_true")
@@ -852,6 +857,52 @@ def classify_walk_forward_verdict(summary: dict[str, Any]) -> str:
     if average_return_pct is None or average_return_pct <= 0:
         return "WEAK_EDGE"
     return "RESEARCH_CANDIDATE"
+
+
+def print_fee_sensitivity_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    rows = [run_fee_sensitivity_summary(conn, args, markets, fee_rate) for fee_rate in FEE_SWEEP_RATES]
+
+    table = Table(title="Fee Sensitivity Walk-Forward Comparison")
+    table.add_column("fee_rate", justify="right")
+    table.add_column("average_return_pct", justify="right")
+    table.add_column("median_return_pct", justify="right")
+    table.add_column("positive_window_count", justify="right")
+    table.add_column("negative_window_count", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for row in rows:
+        table.add_row(
+            format_float(row["fee_rate"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["max_drawdown_pct"]),
+        )
+
+    Console(width=140).print(table)
+
+
+def run_fee_sensitivity_summary(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    markets: list[str],
+    fee_rate: float,
+) -> dict[str, Any]:
+    fee_args = argparse.Namespace(**{**vars(args), "fee_rate": fee_rate})
+    return summarize_fee_sensitivity(fee_rate, run_walk_forward_summaries(conn, fee_args, markets))
+
+
+def summarize_fee_sensitivity(fee_rate: float, summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    walk_forward_summary = summarize_walk_forward(summaries)
+    return {
+        "fee_rate": fee_rate,
+        "average_return_pct": walk_forward_summary["average_return_pct"],
+        "median_return_pct": walk_forward_summary["median_return_pct"],
+        "positive_window_count": walk_forward_summary["positive_window_count"],
+        "negative_window_count": walk_forward_summary["negative_window_count"],
+        "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
+    }
 
 
 def print_market_subset_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:

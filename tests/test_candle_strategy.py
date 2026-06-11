@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.backtest.candle_strategy import (
     Candle,
+    FEE_SWEEP_RATES,
     aligned_mtf_trend,
     bollinger_rsi_parameter_grid,
     build_bollinger_rsi_sweep_report,
@@ -18,6 +19,7 @@ from app.backtest.candle_strategy import (
     main,
     market_subsets,
     sort_market_subset_rows,
+    summarize_fee_sensitivity,
     summarize_market_subset,
     summarize_walk_forward,
     validate_strategy_interval,
@@ -489,6 +491,28 @@ class BollingerRsiSweepJsonReportTests(unittest.TestCase):
         )
 
         self.assertEqual(report["results"][0]["verdict"], "HIGH_DRAWDOWN")
+
+
+class FeeSensitivitySweepTests(unittest.TestCase):
+    def test_fee_sweep_rates_match_requested_grid(self) -> None:
+        self.assertEqual(FEE_SWEEP_RATES, (0.0, 0.0002, 0.0004, 0.0006, 0.0008, 0.0010))
+
+    def test_summarize_fee_sensitivity_uses_walk_forward_metrics(self) -> None:
+        summary = summarize_fee_sensitivity(
+            0.0004,
+            [
+                window_summary("a", "b", 0.8, 2, 0.2),
+                window_summary("b", "c", -0.1, 4, 0.5),
+                window_summary("c", "d", 0.3, 6, 0.4),
+            ],
+        )
+
+        self.assertEqual(summary["fee_rate"], 0.0004)
+        self.assertAlmostEqual(summary["average_return_pct"], (0.8 - 0.1 + 0.3) / 3)
+        self.assertEqual(summary["median_return_pct"], 0.3)
+        self.assertEqual(summary["positive_window_count"], 2)
+        self.assertEqual(summary["negative_window_count"], 1)
+        self.assertEqual(summary["max_drawdown_pct"], 0.5)
 
 
 class MarketSubsetOptimizerTests(unittest.TestCase):
