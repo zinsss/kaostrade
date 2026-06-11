@@ -38,6 +38,9 @@ DYNAMIC_UNIVERSE_MAX_HOLD_HOURS = (None, 6, 12, 24, 48, 72)
 DYNAMIC_UNIVERSE_TAKE_PROFIT_PCTS = (0.5, 1.0, 2.0, 3.0)
 DYNAMIC_UNIVERSE_LOOKBACK_DAYS = 7
 DYNAMIC_UNIVERSE_MARKET_COUNT = 3
+FIXED_UNIVERSE_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE", "KRW-ETH", "KRW-XRP")
+FIXED_UNIVERSE_MIN_SIZE = 1
+FIXED_UNIVERSE_MAX_SIZE = 3
 STRATEGIES = (
     "ema",
     "bollinger",
@@ -121,6 +124,9 @@ def main() -> None:
         if args.compare_dynamic_universe_hold:
             print_dynamic_universe_hold_comparison(conn, config)
             return
+        if args.compare_fixed_universes:
+            print_fixed_universe_comparison(conn)
+            return
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
             return
@@ -179,6 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-fees", action="store_true")
     parser.add_argument("--compare-hold-tp", action="store_true")
     parser.add_argument("--compare-dynamic-universe-hold", action="store_true")
+    parser.add_argument("--compare-fixed-universes", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--json-report", action="store_true")
@@ -1474,6 +1481,148 @@ def format_selected_markets_by_window(values: list[dict[str, Any]]) -> str:
 
 def sort_dynamic_universe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=hold_tp_sort_key)
+
+
+def print_fixed_universe_comparison(conn: sqlite3.Connection) -> None:
+    rows = fixed_universe_rows(conn)
+    Console(width=220).print(fixed_universe_table("Fixed Universe Walk-Forward Comparison", rows))
+    Console(width=220).print(fixed_universe_table("Top 10 Fixed Universes", rows[:10]))
+    Console(width=220).print(fixed_universe_table("Bottom 10 Fixed Universes", rows[-10:]))
+
+
+def fixed_universe_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    args = fixed_universe_args()
+    windows = walk_forward_windows(args.days, args.walk_forward_window_days)
+    single_market_inputs = fixed_universe_single_market_inputs(conn, args, windows)
+    return sort_fixed_universe_rows([
+        run_fixed_universe_summary_from_inputs(markets, single_market_inputs, args)
+        for markets in fixed_universes()
+    ])
+
+
+def fixed_universes() -> list[list[str]]:
+    universes: list[list[str]] = []
+    for universe_size in range(FIXED_UNIVERSE_MIN_SIZE, FIXED_UNIVERSE_MAX_SIZE + 1):
+        universes.extend([list(markets) for markets in combinations(FIXED_UNIVERSE_MARKETS, universe_size)])
+    return universes
+
+
+def run_fixed_universe_summary(conn: sqlite3.Connection, markets: list[str]) -> dict[str, Any]:
+    return summarize_fixed_universe(markets, run_walk_forward_summaries(conn, fixed_universe_args(), markets))
+
+
+def run_fixed_universe_summary_from_inputs(
+    markets: list[str],
+    single_market_inputs: dict[str, list[dict[str, Any]]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    window_count = len(next(iter(single_market_inputs.values()), []))
+    summaries = [
+        run_hold_tp_window_summary(merge_fixed_universe_window_input(markets, single_market_inputs, window_index), args)
+        for window_index in range(window_count)
+    ]
+    return summarize_fixed_universe(markets, summaries)
+
+
+def fixed_universe_single_market_inputs(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    windows: list[tuple[datetime, datetime]],
+) -> dict[str, list[dict[str, Any]]]:
+    return {
+        market: [
+            build_hold_tp_window_input(conn, args, [market], window_start, window_end)
+            for window_start, window_end in windows
+        ]
+        for market in FIXED_UNIVERSE_MARKETS
+    }
+
+
+def merge_fixed_universe_window_input(
+    markets: list[str],
+    single_market_inputs: dict[str, list[dict[str, Any]]],
+    window_index: int,
+) -> dict[str, Any]:
+    selected_inputs = [single_market_inputs[market][window_index] for market in markets]
+    events = [event for window_input in selected_inputs for event in window_input["events"]]
+    events.sort(key=lambda event: (event["ts"], event["market"]))
+    final_prices = {
+        market: price
+        for window_input in selected_inputs
+        for market, price in window_input["final_prices"].items()
+    }
+    return {
+        "window_start": selected_inputs[0]["window_start"],
+        "window_end": selected_inputs[0]["window_end"],
+        "markets": list(markets),
+        "events": events,
+        "final_prices": final_prices,
+        "raw_signal_count": sum(int(window_input["raw_signal_count"]) for window_input in selected_inputs),
+        "accepted_signal_count": sum(int(window_input["accepted_signal_count"]) for window_input in selected_inputs),
+    }
+
+
+def fixed_universe_args() -> argparse.Namespace:
+    return hold_tp_baseline_args()
+
+
+def summarize_fixed_universe(markets: list[str], summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    walk_forward_summary = summarize_walk_forward(summaries)
+    return {
+        "markets": markets,
+        "market_count": len(markets),
+        "average_return_pct": walk_forward_summary["average_return_pct"],
+        "median_return_pct": walk_forward_summary["median_return_pct"],
+        "positive_window_count": walk_forward_summary["positive_window_count"],
+        "negative_window_count": walk_forward_summary["negative_window_count"],
+        "worst_window_return_pct": walk_forward_summary["worst_window_return_pct"],
+        "best_window_return_pct": walk_forward_summary["best_window_return_pct"],
+        "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
+        "trade_count": walk_forward_summary["total_trade_count"],
+    }
+
+
+def sort_fixed_universe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=fixed_universe_sort_key)
+
+
+def fixed_universe_sort_key(row: dict[str, Any]) -> tuple[float, int, float]:
+    average_return_pct = row["average_return_pct"]
+    max_drawdown_pct = row["max_drawdown_pct"]
+    return (
+        -(float(average_return_pct) if average_return_pct is not None else float("-inf")),
+        -int(row["positive_window_count"]),
+        float(max_drawdown_pct) if max_drawdown_pct is not None else float("inf"),
+    )
+
+
+def fixed_universe_table(title: str, rows: list[dict[str, Any]]) -> Table:
+    table = Table(title=title)
+    table.add_column("markets")
+    table.add_column("market_count", justify="right")
+    table.add_column("average_return_pct", justify="right")
+    table.add_column("median_return_pct", justify="right")
+    table.add_column("positive_window_count", justify="right")
+    table.add_column("negative_window_count", justify="right")
+    table.add_column("worst_window_return_pct", justify="right")
+    table.add_column("best_window_return_pct", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("trade_count", justify="right")
+
+    for row in rows:
+        table.add_row(
+            ",".join(row["markets"]),
+            str(row["market_count"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            str(row["trade_count"]),
+        )
+    return table
 
 
 def print_market_subset_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
