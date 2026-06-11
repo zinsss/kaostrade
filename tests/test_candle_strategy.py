@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import sqlite3
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,8 @@ from app.backtest.candle_strategy import (
     build_bollinger_rsi_sweep_report,
     build_compare_all_strategies_report,
     build_walk_forward_report,
+    candle_price_at_or_before,
+    configured_markets_with_candles,
     classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
@@ -27,6 +30,8 @@ from app.backtest.candle_strategy import (
     parse_args,
     hold_tp_baseline_args,
     hold_tp_sweep_args,
+    prior_market_return,
+    rank_dynamic_universe_markets,
     market_subsets,
     risk_exit_for_position,
     sort_hold_tp_rows,
@@ -34,6 +39,7 @@ from app.backtest.candle_strategy import (
     summarize_fee_sensitivity,
     summarize_hold_tp_result,
     summarize_market_subset,
+    run_dynamic_universe_summary,
     summarize_walk_forward,
     validate_strategy_interval,
 )
@@ -730,6 +736,92 @@ class HoldTakeProfitSweepTests(unittest.TestCase):
                 imported_modules.add(node.module)
 
         self.assertFalse(any(module.startswith("app.paper") for module in imported_modules))
+
+
+class DynamicUniverseHoldSweepTests(unittest.TestCase):
+    def sqlite_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE candles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                candle_date_time_utc TEXT NOT NULL,
+                trade_price REAL NOT NULL
+            )
+            """
+        )
+        return conn
+
+    def insert_candle(self, conn: sqlite3.Connection, market: str, minutes: int, price: float) -> None:
+        conn.execute(
+            """
+            INSERT INTO candles (market, interval, candle_date_time_utc, trade_price)
+            VALUES (?, '1m', ?, ?)
+            """,
+            (market, ts(minutes), price),
+        )
+
+    def test_rank_dynamic_universe_markets_uses_prior_seven_day_return(self) -> None:
+        conn = self.sqlite_conn()
+        window_start = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        start_minutes = 7 * 24 * 60
+        for market, old_price, current_price in [
+            ("KRW-BTC", 100.0, 110.0),
+            ("KRW-SOL", 100.0, 140.0),
+            ("KRW-DOGE", 100.0, 105.0),
+            ("KRW-XRP", 100.0, 130.0),
+        ]:
+            self.insert_candle(conn, market, 0, old_price)
+            self.insert_candle(conn, market, start_minutes, current_price)
+
+        ranked = rank_dynamic_universe_markets(
+            conn,
+            ["KRW-BTC", "KRW-SOL", "KRW-DOGE", "KRW-XRP"],
+            window_start,
+        )
+
+        self.assertEqual(ranked, ["KRW-SOL", "KRW-XRP", "KRW-BTC", "KRW-DOGE"])
+        self.assertAlmostEqual(prior_market_return(conn, "KRW-SOL", window_start, 7), 0.4)
+
+    def test_candle_price_at_or_before_and_available_market_filter(self) -> None:
+        conn = self.sqlite_conn()
+        self.insert_candle(conn, "KRW-BTC", 0, 100.0)
+        self.insert_candle(conn, "KRW-BTC", 10, 125.0)
+
+        self.assertEqual(
+            candle_price_at_or_before(conn, "KRW-BTC", datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc)),
+            100.0,
+        )
+        self.assertEqual(
+            configured_markets_with_candles(conn, ["KRW-BTC", "KRW-ETH"]),
+            ["KRW-BTC"],
+        )
+
+    def test_dynamic_summary_records_selected_markets_by_window(self) -> None:
+        window_inputs = [
+            {
+                "window_start": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                "window_end": datetime(2026, 1, 2, tzinfo=timezone.utc),
+                "markets": ["KRW-SOL", "KRW-XRP", "KRW-BTC"],
+                "events": [],
+                "final_prices": {},
+                "raw_signal_count": 0,
+                "accepted_signal_count": 0,
+            }
+        ]
+
+        summary = run_dynamic_universe_summary(window_inputs, None, 0.5, "dynamic_candidate_v1")
+
+        self.assertEqual(summary["label"], "dynamic_candidate_v1")
+        self.assertEqual(summary["universe_mode"], "dynamic_top3_prior_7d")
+        self.assertIsNone(summary["max_hold_hours"])
+        self.assertEqual(summary["take_profit_pct"], 0.5)
+        self.assertEqual(summary["selected_markets_by_window"], [
+            {"window_start": "2026-01-01T00:00:00", "markets": ["KRW-SOL", "KRW-XRP", "KRW-BTC"]}
+        ])
 
 
 class MarketSubsetOptimizerTests(unittest.TestCase):
