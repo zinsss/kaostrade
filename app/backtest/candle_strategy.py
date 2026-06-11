@@ -84,11 +84,16 @@ class Position:
     quantity: float
     average_entry_price: float
     entry_ts: str
+    entry_fee_krw: float = 0.0
 
 
 def main() -> None:
     args = parse_args()
+    explicit_days = args.days is not None
+    explicit_walk_forward_window_days = args.walk_forward_window_days is not None
     apply_profile_defaults(args)
+    args.explicit_days = explicit_days
+    args.explicit_walk_forward_window_days = explicit_walk_forward_window_days
     if args.json_report and not (args.walk_forward or args.compare_all_strategies or args.compare_bollinger_rsi):
         raise SystemExit("--json-report requires --walk-forward, --compare-all-strategies, or --compare-bollinger-rsi")
 
@@ -127,6 +132,12 @@ def main() -> None:
         if args.compare_fixed_universes:
             print_fixed_universe_comparison(conn)
             return
+        if args.trade_attribution:
+            print_trade_attribution(conn)
+            return
+        if args.long_validation:
+            print_long_validation(conn, args)
+            return
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
             return
@@ -154,6 +165,7 @@ def main() -> None:
             max_hold_hours=getattr(args, "max_hold_hours", None),
         )
 
+    summary.pop("all_trades", None)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
 
 
@@ -186,6 +198,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-hold-tp", action="store_true")
     parser.add_argument("--compare-dynamic-universe-hold", action="store_true")
     parser.add_argument("--compare-fixed-universes", action="store_true")
+    parser.add_argument("--trade-attribution", action="store_true")
+    parser.add_argument("--long-validation", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--json-report", action="store_true")
@@ -1144,7 +1158,12 @@ def run_hold_tp_window_summary(window_input: dict[str, Any], args: argparse.Name
                 quantity = args.trade_notional_krw / price
                 fee_krw = args.trade_notional_krw * args.fee_rate
                 cash -= total_cost
-                positions[market] = Position(quantity=quantity, average_entry_price=price, entry_ts=ts)
+                positions[market] = Position(
+                    quantity=quantity,
+                    average_entry_price=price,
+                    entry_ts=ts,
+                    entry_fee_krw=fee_krw,
+                )
                 total_fees_krw += fee_krw
                 buy_count += 1
                 trades.append(simulated_trade(ts, "BUY", market, price, quantity, args.trade_notional_krw, fee_krw, "SIGNAL"))
@@ -1205,6 +1224,7 @@ def run_hold_tp_window_summary(window_input: dict[str, Any], args: argparse.Name
         "max_drawdown_pct": max_drawdown_pct(equity_curve),
         "average_hold_minutes": average_hold_minutes(hold_minutes),
         "trades": trades[-20:],
+        "all_trades": trades,
     }
 
 
@@ -1488,6 +1508,237 @@ def print_fixed_universe_comparison(conn: sqlite3.Connection) -> None:
     Console(width=220).print(fixed_universe_table("Fixed Universe Walk-Forward Comparison", rows))
     Console(width=220).print(fixed_universe_table("Top 10 Fixed Universes", rows[:10]))
     Console(width=220).print(fixed_universe_table("Bottom 10 Fixed Universes", rows[-10:]))
+
+
+def print_trade_attribution(conn: sqlite3.Connection) -> None:
+    summaries = candidate_v1_walk_forward_summaries(conn)
+    closed_trades = closed_trades_from_summaries(summaries)
+    console = Console(width=180)
+    console.print(trade_attribution_table("Trade Attribution by Market", attribution_rows(closed_trades, "market"), "market"))
+    console.print(trade_attribution_table("Trade Attribution by Month", attribution_rows(closed_trades, "month"), "month"))
+    console.print(trade_attribution_table("Trade Attribution by Exit Reason", attribution_rows(closed_trades, "exit_reason"), "exit_reason", include_average_hold=True))
+    console.print(trade_detail_table("Worst 10 Trades", worst_trades(closed_trades, 10)))
+    console.print(trade_detail_table("Best 10 Trades", best_trades(closed_trades, 10)))
+
+
+def print_long_validation(conn: sqlite3.Connection, args: argparse.Namespace) -> None:
+    validation_args = long_validation_args(args)
+    summaries = candidate_v1_walk_forward_summaries(
+        conn,
+        days=validation_args.days,
+        walk_forward_window_days=validation_args.walk_forward_window_days,
+    )
+    console = Console(width=160)
+    print_walk_forward_summary_tables(console, summaries)
+    console.print(long_validation_verdict_table(validation_args, summarize_walk_forward(summaries)))
+
+
+def candidate_v1_walk_forward_summaries(
+    conn: sqlite3.Connection,
+    days: int | None = None,
+    walk_forward_window_days: int | None = None,
+) -> list[dict[str, Any]]:
+    args = hold_tp_baseline_args()
+    if days is not None:
+        args.days = days
+    if walk_forward_window_days is not None:
+        args.walk_forward_window_days = walk_forward_window_days
+    return run_walk_forward_summaries(conn, args, list(HOLD_TP_MARKETS))
+
+
+def long_validation_args(args: argparse.Namespace) -> argparse.Namespace:
+    validation_args = hold_tp_baseline_args()
+    validation_args.days = args.days if getattr(args, "explicit_days", False) else 365
+    validation_args.walk_forward_window_days = (
+        args.walk_forward_window_days if getattr(args, "explicit_walk_forward_window_days", False) else 30
+    )
+    return validation_args
+
+
+def print_walk_forward_summary_tables(console: Console, summaries: list[dict[str, Any]]) -> None:
+    table = Table(title="Walk-Forward Backtest")
+    table.add_column("window_start")
+    table.add_column("window_end")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("total_fees_krw", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for summary in summaries:
+        table.add_row(
+            summary["window_start"],
+            summary["window_end"],
+            str(summary["trade_count"]),
+            format_float(summary["return_pct"]),
+            format_float(summary["total_fees_krw"]),
+            format_float(summary["max_drawdown_pct"]),
+        )
+
+    report_summary = summarize_walk_forward(summaries)
+    summary_table = Table(title="Walk-Forward Summary")
+    summary_table.add_column("average_return_pct", justify="right")
+    summary_table.add_column("median_return_pct", justify="right")
+    summary_table.add_column("positive_window_count", justify="right")
+    summary_table.add_column("negative_window_count", justify="right")
+    summary_table.add_column("worst_window_return_pct", justify="right")
+    summary_table.add_column("best_window_return_pct", justify="right")
+    summary_table.add_row(
+        format_optional_float(report_summary["average_return_pct"]),
+        format_optional_float(report_summary["median_return_pct"]),
+        str(report_summary["positive_window_count"]),
+        str(report_summary["negative_window_count"]),
+        format_optional_float(report_summary["worst_window_return_pct"]),
+        format_optional_float(report_summary["best_window_return_pct"]),
+    )
+    console.print(table)
+    console.print(summary_table)
+
+
+def long_validation_verdict_table(args: argparse.Namespace, summary: dict[str, Any]) -> Table:
+    table = Table(title="Long-History Validation Verdict")
+    table.add_column("days", justify="right")
+    table.add_column("window_days", justify="right")
+    table.add_column("positive_window_count", justify="right")
+    table.add_column("negative_window_count", justify="right")
+    table.add_column("average_return_pct", justify="right")
+    table.add_column("median_return_pct", justify="right")
+    table.add_column("worst_window_return_pct", justify="right")
+    table.add_column("best_window_return_pct", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("trade_count", justify="right")
+    table.add_row(
+        str(args.days),
+        str(args.walk_forward_window_days),
+        str(summary["positive_window_count"]),
+        str(summary["negative_window_count"]),
+        format_optional_float(summary["average_return_pct"]),
+        format_optional_float(summary["median_return_pct"]),
+        format_optional_float(summary["worst_window_return_pct"]),
+        format_optional_float(summary["best_window_return_pct"]),
+        format_optional_float(summary["worst_max_drawdown_pct"]),
+        str(summary["total_trade_count"]),
+    )
+    return table
+
+
+def closed_trades_from_summaries(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        trade
+        for summary in summaries
+        for trade in summary.get("all_trades", [])
+        if trade.get("side") == "SELL"
+    ]
+
+
+def attribution_rows(trades: list[dict[str, Any]], group_by: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        key = trade_attribution_key(trade, group_by)
+        grouped.setdefault(key, []).append(trade)
+    rows = [summarize_attribution_group(key, values, group_by) for key, values in grouped.items()]
+    return sorted(rows, key=lambda row: row[group_by])
+
+
+def trade_attribution_key(trade: dict[str, Any], group_by: str) -> str:
+    if group_by == "market":
+        return str(trade["market"])
+    if group_by == "month":
+        return str(trade["ts"])[:7]
+    if group_by == "exit_reason":
+        return str(trade["reason"])
+    raise ValueError(f"Unsupported attribution group: {group_by}")
+
+
+def summarize_attribution_group(key: str, trades: list[dict[str, Any]], group_by: str) -> dict[str, Any]:
+    net_values = [float(trade.get("net_pnl_krw", 0.0)) for trade in trades]
+    hold_values = [float(trade["hold_minutes"]) for trade in trades if trade.get("hold_minutes") is not None]
+    trade_count = len(trades)
+    return {
+        group_by: key,
+        "trade_count": trade_count,
+        "win_count": sum(1 for value in net_values if value > 0),
+        "loss_count": sum(1 for value in net_values if value < 0),
+        "win_rate_pct": (sum(1 for value in net_values if value > 0) / trade_count * 100) if trade_count else None,
+        "gross_pnl_krw": sum(float(trade.get("gross_pnl_krw", 0.0)) for trade in trades),
+        "fees_krw": sum(float(trade.get("total_fee_krw", trade.get("fee_krw", 0.0))) for trade in trades),
+        "net_pnl_krw": sum(net_values),
+        "average_net_pnl_krw": mean(net_values) if net_values else None,
+        "average_hold_minutes": mean(hold_values) if hold_values else None,
+    }
+
+
+def trade_attribution_table(
+    title: str,
+    rows: list[dict[str, Any]],
+    group_column: str,
+    include_average_hold: bool = False,
+) -> Table:
+    table = Table(title=title)
+    table.add_column(group_column)
+    table.add_column("trade_count", justify="right")
+    table.add_column("win_count", justify="right")
+    table.add_column("loss_count", justify="right")
+    table.add_column("win_rate_pct", justify="right")
+    table.add_column("gross_pnl_krw", justify="right")
+    table.add_column("fees_krw", justify="right")
+    table.add_column("net_pnl_krw", justify="right")
+    if group_column == "market":
+        table.add_column("average_net_pnl_krw", justify="right")
+    if group_column == "market" or include_average_hold:
+        table.add_column("average_hold_minutes", justify="right")
+    for row in rows:
+        values = [
+            str(row[group_column]),
+            str(row["trade_count"]),
+            str(row["win_count"]),
+            str(row["loss_count"]),
+            format_optional_float(row["win_rate_pct"]),
+            format_float(row["gross_pnl_krw"]),
+            format_float(row["fees_krw"]),
+            format_float(row["net_pnl_krw"]),
+        ]
+        if group_column == "market":
+            values.append(format_optional_float(row["average_net_pnl_krw"]))
+        if group_column == "market" or include_average_hold:
+            values.append(format_optional_float(row["average_hold_minutes"]))
+        table.add_row(*values)
+    return table
+
+
+def worst_trades(trades: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    return sorted(trades, key=lambda trade: float(trade.get("net_pnl_krw", 0.0)))[:limit]
+
+
+def best_trades(trades: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    return sorted(trades, key=lambda trade: float(trade.get("net_pnl_krw", 0.0)), reverse=True)[:limit]
+
+
+def trade_detail_table(title: str, trades: list[dict[str, Any]]) -> Table:
+    table = Table(title=title)
+    table.add_column("market")
+    table.add_column("entry_ts")
+    table.add_column("exit_ts")
+    table.add_column("exit_reason")
+    table.add_column("entry_price", justify="right")
+    table.add_column("exit_price", justify="right")
+    table.add_column("gross_pnl_krw", justify="right")
+    table.add_column("fee_krw", justify="right")
+    table.add_column("net_pnl_krw", justify="right")
+    table.add_column("hold_minutes", justify="right")
+    for trade in trades:
+        table.add_row(
+            str(trade["market"]),
+            str(trade.get("entry_ts", "-")),
+            str(trade["ts"]),
+            str(trade["reason"]),
+            format_float(float(trade.get("entry_price", 0.0))),
+            format_float(float(trade["price"])),
+            format_float(float(trade.get("gross_pnl_krw", 0.0))),
+            format_float(float(trade.get("total_fee_krw", trade.get("fee_krw", 0.0)))),
+            format_float(float(trade.get("net_pnl_krw", 0.0))),
+            format_optional_float(trade.get("hold_minutes")),
+        )
+    return table
 
 
 def fixed_universe_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1874,7 +2125,12 @@ def run_backtest(
                 quantity = trade_notional_krw / price
                 fee_krw = trade_notional_krw * fee_rate
                 cash -= total_cost
-                positions[market] = Position(quantity=quantity, average_entry_price=price, entry_ts=ts)
+                positions[market] = Position(
+                    quantity=quantity,
+                    average_entry_price=price,
+                    entry_ts=ts,
+                    entry_fee_krw=fee_krw,
+                )
                 total_fees_krw += fee_krw
                 buy_count += 1
                 trades.append(simulated_trade(ts, "BUY", market, price, quantity, trade_notional_krw, fee_krw, "SIGNAL"))
@@ -1933,6 +2189,7 @@ def run_backtest(
         "max_drawdown_pct": max_drawdown_pct(equity_curve),
         "average_hold_minutes": average_hold_minutes(hold_minutes),
         "trades": trades[-20:],
+        "all_trades": trades,
     }
 
 
@@ -2373,8 +2630,22 @@ def close_position(
     notional = position.quantity * price
     fee_krw = notional * fee_rate
     new_cash = cash + notional - fee_krw
-    realized_delta = notional - fee_krw - (position.quantity * position.average_entry_price)
+    cost_basis = position.quantity * position.average_entry_price
+    gross_pnl_krw = notional - cost_basis
+    total_fee_krw = position.entry_fee_krw + fee_krw
+    net_pnl_krw = gross_pnl_krw - total_fee_krw
+    realized_delta = notional - fee_krw - cost_basis
     trade = simulated_trade(ts, "SELL", market, price, position.quantity, notional, fee_krw, reason)
+    trade.update({
+        "entry_ts": position.entry_ts,
+        "entry_price": position.average_entry_price,
+        "entry_fee_krw": position.entry_fee_krw,
+        "exit_fee_krw": fee_krw,
+        "total_fee_krw": total_fee_krw,
+        "gross_pnl_krw": gross_pnl_krw,
+        "net_pnl_krw": net_pnl_krw,
+        "hold_minutes": position_hold_minutes(position, ts),
+    })
     return new_cash, realized_delta, fee_krw, trade
 
 
