@@ -21,14 +21,18 @@ from app.backtest.candle_strategy import (
     bollinger_rsi_parameter_grid,
     build_bollinger_rsi_sweep_report,
     build_compare_all_strategies_report,
+    attribution_rows,
+    best_trades,
     build_walk_forward_report,
     candle_price_at_or_before,
+    close_position,
     configured_markets_with_candles,
     fixed_universe_args,
     fixed_universes,
     classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
+    long_validation_args,
     main,
     merge_fixed_universe_window_input,
     parse_args,
@@ -48,6 +52,7 @@ from app.backtest.candle_strategy import (
     run_dynamic_universe_summary,
     summarize_walk_forward,
     validate_strategy_interval,
+    worst_trades,
 )
 
 
@@ -828,6 +833,117 @@ class DynamicUniverseHoldSweepTests(unittest.TestCase):
         self.assertEqual(summary["selected_markets_by_window"], [
             {"window_start": "2026-01-01T00:00:00", "markets": ["KRW-SOL", "KRW-XRP", "KRW-BTC"]}
         ])
+
+
+class CandidateV1AttributionTests(unittest.TestCase):
+    def test_close_position_records_round_trip_attribution_fields(self) -> None:
+        position = Position(quantity=2.0, average_entry_price=100.0, entry_ts=ts(0), entry_fee_krw=1.0)
+
+        cash, realized_delta, fee_krw, trade = close_position(
+            0.0,
+            position,
+            ts(60),
+            "KRW-BTC",
+            110.0,
+            0.01,
+            "TAKE_PROFIT",
+        )
+
+        self.assertAlmostEqual(cash, 217.8)
+        self.assertAlmostEqual(realized_delta, 17.8)
+        self.assertAlmostEqual(fee_krw, 2.2)
+        self.assertEqual(trade["entry_ts"], ts(0))
+        self.assertEqual(trade["entry_price"], 100.0)
+        self.assertAlmostEqual(trade["gross_pnl_krw"], 20.0)
+        self.assertAlmostEqual(trade["total_fee_krw"], 3.2)
+        self.assertAlmostEqual(trade["net_pnl_krw"], 16.8)
+        self.assertAlmostEqual(trade["hold_minutes"], 60.0)
+
+    def test_attribution_rows_group_by_market_and_include_fees_in_net_pnl(self) -> None:
+        trades = [
+            {
+                "market": "KRW-BTC",
+                "ts": "2026-01-01T01:00:00",
+                "reason": "SIGNAL",
+                "gross_pnl_krw": 100.0,
+                "total_fee_krw": 10.0,
+                "net_pnl_krw": 90.0,
+                "hold_minutes": 30.0,
+            },
+            {
+                "market": "KRW-BTC",
+                "ts": "2026-01-02T01:00:00",
+                "reason": "TAKE_PROFIT",
+                "gross_pnl_krw": -20.0,
+                "total_fee_krw": 5.0,
+                "net_pnl_krw": -25.0,
+                "hold_minutes": 90.0,
+            },
+        ]
+
+        rows = attribution_rows(trades, "market")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["market"], "KRW-BTC")
+        self.assertEqual(rows[0]["trade_count"], 2)
+        self.assertEqual(rows[0]["win_count"], 1)
+        self.assertEqual(rows[0]["loss_count"], 1)
+        self.assertAlmostEqual(rows[0]["win_rate_pct"], 50.0)
+        self.assertAlmostEqual(rows[0]["gross_pnl_krw"], 80.0)
+        self.assertAlmostEqual(rows[0]["fees_krw"], 15.0)
+        self.assertAlmostEqual(rows[0]["net_pnl_krw"], 65.0)
+        self.assertAlmostEqual(rows[0]["average_net_pnl_krw"], 32.5)
+        self.assertAlmostEqual(rows[0]["average_hold_minutes"], 60.0)
+
+    def test_attribution_rows_group_by_exit_month_and_reason(self) -> None:
+        trades = [
+            {"market": "KRW-BTC", "ts": "2026-01-01T00:00:00", "reason": "SIGNAL", "net_pnl_krw": 1.0},
+            {"market": "KRW-SOL", "ts": "2026-01-15T00:00:00", "reason": "SIGNAL", "net_pnl_krw": -1.0},
+            {"market": "KRW-DOGE", "ts": "2026-02-01T00:00:00", "reason": "TAKE_PROFIT", "net_pnl_krw": 2.0},
+        ]
+
+        by_month = attribution_rows(trades, "month")
+        by_reason = attribution_rows(trades, "exit_reason")
+
+        self.assertEqual([row["month"] for row in by_month], ["2026-01", "2026-02"])
+        self.assertEqual(by_month[0]["trade_count"], 2)
+        self.assertEqual([row["exit_reason"] for row in by_reason], ["SIGNAL", "TAKE_PROFIT"])
+
+    def test_best_and_worst_trades_sort_by_net_pnl(self) -> None:
+        trades = [
+            {"net_pnl_krw": 1.0},
+            {"net_pnl_krw": -5.0},
+            {"net_pnl_krw": 3.0},
+        ]
+
+        self.assertEqual(worst_trades(trades, 2), [{"net_pnl_krw": -5.0}, {"net_pnl_krw": 1.0}])
+        self.assertEqual(best_trades(trades, 2), [{"net_pnl_krw": 3.0}, {"net_pnl_krw": 1.0}])
+
+    def test_long_validation_defaults_to_365_days_and_allows_overrides(self) -> None:
+        default_args = argparse.Namespace(
+            days=30,
+            walk_forward_window_days=10,
+            explicit_days=False,
+            explicit_walk_forward_window_days=False,
+        )
+        overridden_args = argparse.Namespace(
+            days=720,
+            walk_forward_window_days=60,
+            explicit_days=True,
+            explicit_walk_forward_window_days=True,
+        )
+
+        defaults = long_validation_args(default_args)
+        overrides = long_validation_args(overridden_args)
+
+        self.assertEqual(defaults.days, 365)
+        self.assertEqual(defaults.walk_forward_window_days, 30)
+        self.assertEqual(overrides.days, 720)
+        self.assertEqual(overrides.walk_forward_window_days, 60)
+        self.assertEqual(defaults.strategy, "bollinger_rsi_and_mtf")
+        self.assertEqual(defaults.take_profit_pct, 0.5)
+        self.assertEqual(defaults.stop_loss_pct, 0)
+
 
 
 class FixedUniverseComparisonTests(unittest.TestCase):
