@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 
 from app.paper.simulator import (
@@ -7,6 +8,7 @@ from app.paper.simulator import (
     apply_buy_signal,
     apply_sell_signal,
     initial_state,
+    initialize_from_latest_candles,
     normalize_state,
     summarize_state,
     unprocessed_signals_for_market,
@@ -100,6 +102,56 @@ class PaperSimulatorTests(unittest.TestCase):
         signals = unprocessed_signals_for_market(profile, "KRW-BTC", candles, state)
 
         self.assertTrue(all(signal["ts"] > "2026-01-01T00:52:00" for signal in signals))
+
+
+class PaperSimulatorStartNowTests(unittest.TestCase):
+    def test_initialize_from_latest_candles_sets_processed_timestamps_without_trades(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE candles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market TEXT,
+                interval TEXT,
+                candle_date_time_utc TEXT,
+                trade_price REAL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO candles (market, interval, candle_date_time_utc, trade_price) VALUES (?, ?, ?, ?)",
+            [
+                ("KRW-BTC", "1m", "2026-01-01T00:00:00", 100.0),
+                ("KRW-BTC", "1m", "2026-01-01T00:01:00", 101.0),
+                ("KRW-SOL", "1m", "2026-01-01T00:02:00", 20.0),
+            ],
+        )
+        profile = {
+            "strategy": "ema",
+            "markets": ["KRW-BTC", "KRW-SOL"],
+            "days": 999,
+            "interval": "1m",
+        }
+
+        result = initialize_from_latest_candles(conn, profile, initial_state())
+
+        self.assertEqual(result["state"]["cash_krw"], 1_000_000.0)
+        self.assertEqual(result["state"]["positions"], {})
+        self.assertEqual(result["state"]["trade_log"], [])
+        self.assertEqual(result["state"]["realized_pnl_krw"], 0.0)
+        self.assertEqual(
+            result["state"]["last_processed_timestamp_by_market"],
+            {
+                "KRW-BTC": "2026-01-01T00:01:00",
+                "KRW-SOL": "2026-01-01T00:02:00",
+            },
+        )
+        self.assertEqual(result["summary"]["cash"], 1_000_000.0)
+        self.assertEqual(result["summary"]["equity"], 1_000_000.0)
+        self.assertEqual(result["summary"]["trade_count"], 0)
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["action_message"], "Initialized from latest candles; no historical actions")
 
 
 if __name__ == "__main__":

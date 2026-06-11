@@ -35,9 +35,12 @@ def main() -> None:
     profile = get_strategy_profile(args.profile)
     state_path = Path(args.state_path)
 
-    state = initial_state() if args.reset else load_state(state_path)
+    state = initial_state() if args.reset or args.start_now else load_state(state_path)
     with connect_read_only(db_path) as conn:
-        result = run_simulator(conn, profile, state)
+        if args.start_now:
+            result = initialize_from_latest_candles(conn, profile, state)
+        else:
+            result = run_simulator(conn, profile, state)
 
     save_state(state_path, result["state"])
     print_simulator_result(result)
@@ -48,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", choices=profile_names(), required=True)
     parser.add_argument("--state-path", default=DEFAULT_STATE_PATH)
     parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--start-now", action="store_true")
     return parser.parse_args()
 
 
@@ -87,6 +91,36 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def initialize_from_latest_candles(
+    conn: sqlite3.Connection,
+    profile: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    state = normalize_state(state)
+    strategy = str(profile["strategy"])
+    interval = str(profile.get("interval", DEFAULT_INTERVAL))
+    validate_strategy_interval(strategy, interval)
+
+    markets = list(profile.get("markets") or [])
+    if not markets:
+        raise ValueError("Strategy profile has no markets")
+
+    latest_prices: dict[str, float] = {}
+    for market in markets:
+        candles = load_candles(conn, market, interval, int(profile.get("days", DEFAULT_DAYS)))
+        if not candles:
+            continue
+        latest_prices[market] = candles[-1].price
+        state["last_processed_timestamp_by_market"][market] = candles[-1].ts
+
+    return {
+        "state": state,
+        "summary": summarize_state(state, latest_prices),
+        "actions": [],
+        "action_message": "Initialized from latest candles; no historical actions",
+    }
 
 
 def run_simulator(conn: sqlite3.Connection, profile: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
@@ -301,7 +335,7 @@ def print_simulator_result(result: dict[str, Any]) -> None:
                 action["reason"],
             )
     else:
-        actions_table.add_row("-", "-", "-", "-", "-", "-", "No new actions")
+        actions_table.add_row("-", "-", "-", "-", "-", "-", result.get("action_message", "No new actions"))
 
     console.print(actions_table)
 
