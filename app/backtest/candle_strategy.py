@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from itertools import combinations
 from pathlib import Path
 from statistics import mean, median, pstdev
 from typing import Any
@@ -96,6 +97,9 @@ def main() -> None:
         if args.compare_bollinger_rsi:
             print_bollinger_rsi_comparison(conn, args, markets)
             return
+        if args.compare_market_subsets:
+            print_market_subset_comparison(conn, args, configured_markets(config))
+            return
         if args.compare_rsi:
             print_rsi_comparison(conn, args, markets)
             return
@@ -148,6 +152,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-risk", action="store_true")
     parser.add_argument("--compare-all-strategies", action="store_true")
     parser.add_argument("--compare-bollinger-rsi", action="store_true")
+    parser.add_argument("--compare-market-subsets", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--json-report", action="store_true")
@@ -847,6 +852,93 @@ def classify_walk_forward_verdict(summary: dict[str, Any]) -> str:
     if average_return_pct is None or average_return_pct <= 0:
         return "WEAK_EDGE"
     return "RESEARCH_CANDIDATE"
+
+
+def print_market_subset_comparison(conn: sqlite3.Connection, args: argparse.Namespace, markets: list[str]) -> None:
+    rows = sort_market_subset_rows([
+        run_market_subset_summary(conn, args, subset)
+        for subset in market_subsets(markets)
+    ])
+
+    table = Table(title="Market Subset Walk-Forward Comparison")
+    table.add_column("markets")
+    table.add_column("market_count", justify="right")
+    table.add_column("trade_count", justify="right")
+    table.add_column("return_pct", justify="right")
+    table.add_column("median_window_return_pct", justify="right")
+    table.add_column("positive_window_count", justify="right")
+    table.add_column("negative_window_count", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+
+    for row in rows:
+        table.add_row(
+            ",".join(row["markets"]),
+            str(row["market_count"]),
+            str(row["trade_count"]),
+            format_optional_float(row["return_pct"]),
+            format_optional_float(row["median_window_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["max_drawdown_pct"]),
+        )
+
+    Console(width=180).print(table)
+
+
+def market_subsets(markets: list[str]) -> list[list[str]]:
+    deduped_markets = dedupe(markets)
+    subsets: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def append_subset(values: list[str]) -> None:
+        key = tuple(values)
+        if key in seen:
+            return
+        subsets.append(values)
+        seen.add(key)
+
+    append_subset(deduped_markets)
+    max_subset_size = min(4, len(deduped_markets))
+    for subset_size in range(1, max_subset_size + 1):
+        for subset in combinations(deduped_markets, subset_size):
+            append_subset(list(subset))
+    return subsets
+
+
+def run_market_subset_summary(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    markets: list[str],
+) -> dict[str, Any]:
+    return summarize_market_subset(markets, run_walk_forward_summaries(conn, args, markets))
+
+
+def summarize_market_subset(markets: list[str], summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    walk_forward_summary = summarize_walk_forward(summaries)
+    return {
+        "markets": markets,
+        "market_count": len(markets),
+        "trade_count": walk_forward_summary["total_trade_count"],
+        "return_pct": walk_forward_summary["average_return_pct"],
+        "median_window_return_pct": walk_forward_summary["median_return_pct"],
+        "positive_window_count": walk_forward_summary["positive_window_count"],
+        "negative_window_count": walk_forward_summary["negative_window_count"],
+        "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
+    }
+
+
+def sort_market_subset_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=market_subset_sort_key)
+
+
+def market_subset_sort_key(row: dict[str, Any]) -> tuple[float, int, float]:
+    average_return_pct = row["return_pct"]
+    max_drawdown_pct = row["max_drawdown_pct"]
+    return (
+        -(float(average_return_pct) if average_return_pct is not None else float("-inf")),
+        -int(row["positive_window_count"]),
+        float(max_drawdown_pct) if max_drawdown_pct is not None else float("inf"),
+    )
 
 
 def walk_forward_windows(days: int, window_days: int) -> list[tuple[datetime, datetime]]:
