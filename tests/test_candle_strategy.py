@@ -16,6 +16,9 @@ from app.backtest.candle_strategy import (
     classify_walk_forward_verdict,
     derive_five_minute_candles,
     main,
+    market_subsets,
+    sort_market_subset_rows,
+    summarize_market_subset,
     summarize_walk_forward,
     validate_strategy_interval,
 )
@@ -486,6 +489,76 @@ class BollingerRsiSweepJsonReportTests(unittest.TestCase):
         )
 
         self.assertEqual(report["results"][0]["verdict"], "HIGH_DRAWDOWN")
+
+
+class MarketSubsetOptimizerTests(unittest.TestCase):
+    def test_market_subsets_include_all_markets_and_one_to_four_market_combinations(self) -> None:
+        subsets = market_subsets(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE"])
+
+        self.assertEqual(subsets[0], ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE"])
+        self.assertEqual(len(subsets), 31)
+        self.assertIn(["KRW-BTC"], subsets)
+        self.assertIn(["KRW-BTC", "KRW-ETH"], subsets)
+        self.assertIn(["KRW-BTC", "KRW-ETH", "KRW-XRP"], subsets)
+        self.assertIn(["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL"], subsets)
+
+    def test_market_subsets_deduplicate_when_all_markets_is_at_most_four_symbols(self) -> None:
+        subsets = market_subsets(["KRW-BTC", "KRW-ETH", "KRW-BTC"])
+
+        self.assertEqual(subsets, [
+            ["KRW-BTC", "KRW-ETH"],
+            ["KRW-BTC"],
+            ["KRW-ETH"],
+        ])
+
+    def test_summarize_market_subset_uses_walk_forward_metrics(self) -> None:
+        summary = summarize_market_subset(
+            ["KRW-BTC", "KRW-ETH"],
+            [
+                window_summary("a", "b", 1.0, 2, 0.3),
+                window_summary("b", "c", -0.5, 4, 0.8),
+                window_summary("c", "d", 0.2, 6, 0.1),
+            ],
+        )
+
+        self.assertEqual(summary["markets"], ["KRW-BTC", "KRW-ETH"])
+        self.assertEqual(summary["market_count"], 2)
+        self.assertEqual(summary["trade_count"], 12)
+        self.assertAlmostEqual(summary["return_pct"], (1.0 - 0.5 + 0.2) / 3)
+        self.assertEqual(summary["median_window_return_pct"], 0.2)
+        self.assertEqual(summary["positive_window_count"], 2)
+        self.assertEqual(summary["negative_window_count"], 1)
+        self.assertEqual(summary["max_drawdown_pct"], 0.8)
+
+    def test_market_subset_sort_order(self) -> None:
+        rows = [
+            {
+                "markets": ["low"],
+                "return_pct": 0.1,
+                "positive_window_count": 3,
+                "max_drawdown_pct": 0.1,
+            },
+            {
+                "markets": ["better_positive"],
+                "return_pct": 0.2,
+                "positive_window_count": 4,
+                "max_drawdown_pct": 0.5,
+            },
+            {
+                "markets": ["lower_drawdown"],
+                "return_pct": 0.2,
+                "positive_window_count": 4,
+                "max_drawdown_pct": 0.2,
+            },
+        ]
+
+        sorted_rows = sort_market_subset_rows(rows)
+
+        self.assertEqual([row["markets"][0] for row in sorted_rows], [
+            "lower_drawdown",
+            "better_positive",
+            "low",
+        ])
 
 
 if __name__ == "__main__":
