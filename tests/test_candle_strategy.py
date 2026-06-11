@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from app.backtest.candle_strategy import (
     Candle,
     FEE_SWEEP_RATES,
+    apply_profile_defaults,
     aligned_mtf_trend,
     bollinger_rsi_parameter_grid,
     build_bollinger_rsi_sweep_report,
@@ -17,6 +18,7 @@ from app.backtest.candle_strategy import (
     classify_walk_forward_verdict,
     derive_five_minute_candles,
     main,
+    parse_args,
     market_subsets,
     sort_market_subset_rows,
     summarize_fee_sensitivity,
@@ -95,6 +97,61 @@ def window_summary(
         "max_drawdown_pct": max_drawdown_pct,
         "average_hold_minutes": 12.5 if trade_count else None,
     }
+
+
+class StrategyProfileTests(unittest.TestCase):
+    def test_candidate_profile_applies_defaults(self) -> None:
+        with unittest.mock.patch("sys.argv", ["candle_strategy", "--profile", "candidate_v1"]):
+            args = apply_profile_defaults(parse_args())
+
+        self.assertEqual(args.strategy, "bollinger_rsi_and_mtf")
+        self.assertEqual(args.markets, ["KRW-BTC", "KRW-SOL", "KRW-DOGE"])
+        self.assertEqual(args.days, 180)
+        self.assertEqual(args.walk_forward_window_days, 30)
+        self.assertEqual(args.bollinger_period, 10)
+        self.assertEqual(args.bollinger_stddev, 2.0)
+        self.assertEqual(args.rsi_buy_threshold, 20.0)
+        self.assertEqual(args.rsi_sell_threshold, 65.0)
+        self.assertEqual(args.take_profit_pct, 0.5)
+        self.assertEqual(args.stop_loss_pct, 0.0)
+        self.assertEqual(args.min_signal_gap_minutes, 60)
+
+    def test_explicit_cli_args_override_candidate_profile(self) -> None:
+        argv = [
+            "candle_strategy",
+            "--profile",
+            "candidate_v1",
+            "--strategy",
+            "ema",
+            "--market",
+            "KRW-ETH",
+            "--days",
+            "30",
+            "--bollinger-period",
+            "20",
+            "--take-profit-pct",
+            "1.0",
+        ]
+        with unittest.mock.patch("sys.argv", argv):
+            args = apply_profile_defaults(parse_args())
+
+        self.assertEqual(args.strategy, "ema")
+        self.assertEqual(args.markets, ["KRW-ETH"])
+        self.assertEqual(args.days, 30)
+        self.assertEqual(args.bollinger_period, 20)
+        self.assertEqual(args.take_profit_pct, 1.0)
+        self.assertEqual(args.rsi_sell_threshold, 65.0)
+
+    def test_no_profile_keeps_existing_defaults(self) -> None:
+        with unittest.mock.patch("sys.argv", ["candle_strategy"]):
+            args = apply_profile_defaults(parse_args())
+
+        self.assertEqual(args.strategy, "ema")
+        self.assertIsNone(args.markets)
+        self.assertEqual(args.days, 30)
+        self.assertEqual(args.walk_forward_window_days, 10)
+        self.assertEqual(args.bollinger_period, 20)
+        self.assertEqual(args.take_profit_pct, 0.0)
 
 
 class WalkForwardJsonReportTests(unittest.TestCase):

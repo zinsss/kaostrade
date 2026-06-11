@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from app.collector.collect_once import CONFIG_PATH, DEFAULT_DB_PATH, load_config
+from app.backtest.strategy_profiles import get_strategy_profile, profile_names
 
 START_CASH_KRW = 1_000_000.0
 DEFAULT_DAYS = 30
@@ -75,6 +76,7 @@ class Position:
 
 def main() -> None:
     args = parse_args()
+    apply_profile_defaults(args)
     if args.json_report and not (args.walk_forward or args.compare_all_strategies or args.compare_bollinger_rsi):
         raise SystemExit("--json-report requires --walk-forward, --compare-all-strategies, or --compare-bollinger-rsi")
 
@@ -135,22 +137,23 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest candle-based technical strategies.")
-    parser.add_argument("--strategy", choices=STRATEGIES, default="ema")
+    parser.add_argument("--profile", choices=profile_names())
+    parser.add_argument("--strategy", choices=STRATEGIES)
     market_group = parser.add_mutually_exclusive_group()
     market_group.add_argument("--market", action="append", dest="markets")
     market_group.add_argument("--all-markets", action="store_true")
-    parser.add_argument("--days", type=positive_int, default=DEFAULT_DAYS)
+    parser.add_argument("--days", type=positive_int)
     parser.add_argument("--interval", default=DEFAULT_INTERVAL)
     parser.add_argument("--trade-notional-krw", type=positive_float, default=DEFAULT_TRADE_NOTIONAL_KRW)
     parser.add_argument("--fee-rate", type=non_negative_float, default=DEFAULT_FEE_RATE)
-    parser.add_argument("--min-signal-gap-minutes", type=non_negative_int, default=DEFAULT_MIN_SIGNAL_GAP_MINUTES)
-    parser.add_argument("--bollinger-period", type=positive_int, default=DEFAULT_BOLLINGER_PERIOD)
-    parser.add_argument("--bollinger-stddev", type=positive_float, default=DEFAULT_BOLLINGER_STDDEV)
-    parser.add_argument("--take-profit-pct", type=non_negative_float, default=DEFAULT_TAKE_PROFIT_PCT)
-    parser.add_argument("--stop-loss-pct", type=non_negative_float, default=DEFAULT_STOP_LOSS_PCT)
-    parser.add_argument("--rsi-buy-threshold", type=non_negative_float, default=DEFAULT_RSI_BUY_THRESHOLD)
-    parser.add_argument("--rsi-sell-threshold", type=non_negative_float, default=DEFAULT_RSI_SELL_THRESHOLD)
-    parser.add_argument("--walk-forward-window-days", type=positive_int, default=DEFAULT_WALK_FORWARD_WINDOW_DAYS)
+    parser.add_argument("--min-signal-gap-minutes", type=non_negative_int)
+    parser.add_argument("--bollinger-period", type=positive_int)
+    parser.add_argument("--bollinger-stddev", type=positive_float)
+    parser.add_argument("--take-profit-pct", type=non_negative_float)
+    parser.add_argument("--stop-loss-pct", type=non_negative_float)
+    parser.add_argument("--rsi-buy-threshold", type=non_negative_float)
+    parser.add_argument("--rsi-sell-threshold", type=non_negative_float)
+    parser.add_argument("--walk-forward-window-days", type=positive_int)
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--compare-bollinger", action="store_true")
     parser.add_argument("--compare-risk", action="store_true")
@@ -163,6 +166,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-report", action="store_true")
     parser.add_argument("--breakdown-by-market", action="store_true")
     return parser.parse_args()
+
+
+PROFILE_DEFAULTS: dict[str, Any] = {
+    "strategy": "ema",
+    "days": DEFAULT_DAYS,
+    "min_signal_gap_minutes": DEFAULT_MIN_SIGNAL_GAP_MINUTES,
+    "bollinger_period": DEFAULT_BOLLINGER_PERIOD,
+    "bollinger_stddev": DEFAULT_BOLLINGER_STDDEV,
+    "take_profit_pct": DEFAULT_TAKE_PROFIT_PCT,
+    "stop_loss_pct": DEFAULT_STOP_LOSS_PCT,
+    "rsi_buy_threshold": DEFAULT_RSI_BUY_THRESHOLD,
+    "rsi_sell_threshold": DEFAULT_RSI_SELL_THRESHOLD,
+    "walk_forward_window_days": DEFAULT_WALK_FORWARD_WINDOW_DAYS,
+}
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    if args.profile:
+        profile = get_strategy_profile(args.profile)
+        if profile.get("markets") and not args.markets and not args.all_markets:
+            args.markets = list(profile["markets"])
+        for key, value in profile.items():
+            if key == "markets":
+                continue
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+
+    for key, value in PROFILE_DEFAULTS.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    return args
 
 
 def positive_int(value: str) -> int:
