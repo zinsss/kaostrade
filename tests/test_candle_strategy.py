@@ -36,6 +36,8 @@ from app.backtest.candle_strategy import (
     classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
+    derive_timeframe_candles,
+    ema_trend_signals,
     long_validation_args,
     main,
     merge_fixed_universe_window_input,
@@ -54,8 +56,11 @@ from app.backtest.candle_strategy import (
     summarize_hold_tp_result,
     summarize_market_subset,
     run_dynamic_universe_summary,
+    sort_trend_strategy_rows,
     summarize_strategy_family,
     summarize_walk_forward,
+    trend_candidate_v1_args,
+    trend_strategy_args,
     validate_strategy_interval,
     worst_trades,
 )
@@ -140,6 +145,59 @@ class IchimokuStrategyTests(unittest.TestCase):
         self.assertEqual(row["best_window_return_pct"], 1.0)
         self.assertEqual(row["max_drawdown_pct"], 0.8)
         self.assertEqual(row["average_hold_minutes"], 12.5)
+
+
+class TrendStrategyResearchTests(unittest.TestCase):
+    def test_derive_timeframe_candles_aggregates_ohlc_and_uses_last_timestamp(self) -> None:
+        candles = [
+            ohlc_candle(0, 100.0, high=101.0, low=99.0),
+            ohlc_candle(1, 102.0, high=103.0, low=98.0),
+            ohlc_candle(15, 110.0, high=111.0, low=109.0),
+        ]
+
+        derived = derive_timeframe_candles(candles, 15)
+
+        self.assertEqual([item.ts for item in derived], [ts(1), ts(15)])
+        self.assertEqual(derived[0].price, 102.0)
+        self.assertEqual(derived[0].high_price, 103.0)
+        self.assertEqual(derived[0].low_price, 98.0)
+
+    def test_ema_trend_signals_buy_in_uptrend_and_sell_on_cross_down(self) -> None:
+        candles = [candle(index, 100.0 + index) for index in range(70)]
+        candles.extend(candle(70 + index, 170.0 - (index * 4)) for index in range(30))
+
+        signals = ema_trend_signals(candles)
+
+        self.assertGreaterEqual(len(signals), 2)
+        self.assertEqual(signals[0]["signal"], "BUY")
+        self.assertEqual(signals[-1]["signal"], "SELL")
+
+    def test_trend_strategy_args_do_not_modify_candidate_v1(self) -> None:
+        candidate_args = trend_candidate_v1_args()
+        trend_args = trend_strategy_args("donchian_5m")
+
+        self.assertEqual(candidate_args.strategy, "bollinger_rsi_and_mtf")
+        self.assertEqual(candidate_args.take_profit_pct, 0.5)
+        self.assertEqual(candidate_args.min_signal_gap_minutes, 60)
+        self.assertEqual(candidate_args.days, 365)
+        self.assertEqual(candidate_args.walk_forward_window_days, 30)
+        self.assertEqual(trend_args.strategy, "donchian_5m")
+        self.assertEqual(trend_args.take_profit_pct, 0.0)
+        self.assertEqual(trend_args.stop_loss_pct, 0.0)
+        self.assertEqual(trend_args.min_signal_gap_minutes, 0)
+        self.assertEqual(trend_args.days, 365)
+        self.assertEqual(trend_args.walk_forward_window_days, 30)
+
+    def test_trend_strategy_sort_order(self) -> None:
+        rows = [
+            {"strategy": "low", "average_return_pct": 0.1, "positive_window_count": 3, "max_drawdown_pct": 0.1},
+            {"strategy": "better_positive", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.5},
+            {"strategy": "lower_drawdown", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.2},
+        ]
+
+        sorted_rows = sort_trend_strategy_rows(rows)
+
+        self.assertEqual([row["strategy"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
 
 
 class MultiTimeframeTrendTests(unittest.TestCase):

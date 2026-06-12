@@ -48,6 +48,10 @@ STRATEGIES = (
     "ema_rsi",
     "donchian",
     "ichimoku",
+    "donchian_5m",
+    "donchian_15m",
+    "ema_trend_5m",
+    "ema_trend_15m",
     "bollinger_rsi_and",
     "bollinger_rsi_or",
     "bollinger_rsi_and_mtf",
@@ -77,6 +81,15 @@ ICHIMOKU_SENKOU_B = 52
 ICHIMOKU_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
 ICHIMOKU_DAYS = 365
 ICHIMOKU_WALK_FORWARD_WINDOW_DAYS = 30
+TREND_STRATEGY_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
+TREND_STRATEGY_DAYS = 365
+TREND_STRATEGY_WALK_FORWARD_WINDOW_DAYS = 30
+TREND_STRATEGY_ROWS = (
+    ("donchian_5m", "5m"),
+    ("donchian_15m", "15m"),
+    ("ema_trend_5m", "5m"),
+    ("ema_trend_15m", "15m"),
+)
 
 
 @dataclass
@@ -152,6 +165,9 @@ def main() -> None:
         if args.compare_ichimoku:
             print_ichimoku_comparison(conn)
             return
+        if args.compare_trend_strategies:
+            print_trend_strategy_comparison(conn)
+            return
         if args.trade_attribution:
             print_trade_attribution(conn)
             return
@@ -219,6 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-dynamic-universe-hold", action="store_true")
     parser.add_argument("--compare-fixed-universes", action="store_true")
     parser.add_argument("--compare-ichimoku", action="store_true")
+    parser.add_argument("--compare-trend-strategies", action="store_true")
     parser.add_argument("--trade-attribution", action="store_true")
     parser.add_argument("--long-validation", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
@@ -1567,6 +1584,96 @@ def ichimoku_comparison_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
+def print_trend_strategy_comparison(conn: sqlite3.Connection) -> None:
+    rows = sort_trend_strategy_rows(trend_strategy_comparison_rows(conn))
+    table = Table(title="Multi-Timeframe Trend Strategy Comparison")
+    table.add_column("strategy")
+    table.add_column("timeframe")
+    table.add_column("trade_count", justify="right")
+    table.add_column("average_return_pct", justify="right")
+    table.add_column("median_return_pct", justify="right")
+    table.add_column("positive_window_count", justify="right")
+    table.add_column("negative_window_count", justify="right")
+    table.add_column("worst_window_return_pct", justify="right")
+    table.add_column("best_window_return_pct", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    for row in rows:
+        table.add_row(
+            row["strategy"],
+            row["timeframe"],
+            str(row["trade_count"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            format_optional_float(row["average_hold_minutes"]),
+        )
+    Console(width=180).print(table)
+
+
+def trend_strategy_comparison_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = [
+        with_timeframe(
+            summarize_strategy_family(
+                "candidate_v1",
+                run_walk_forward_summaries(conn, trend_candidate_v1_args(), list(TREND_STRATEGY_MARKETS)),
+            ),
+            "1m",
+        )
+    ]
+    for strategy, timeframe in TREND_STRATEGY_ROWS:
+        rows.append(with_timeframe(
+            summarize_strategy_family(
+                strategy,
+                run_walk_forward_summaries(conn, trend_strategy_args(strategy), list(TREND_STRATEGY_MARKETS)),
+            ),
+            timeframe,
+        ))
+    return rows
+
+
+def trend_candidate_v1_args() -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.days = TREND_STRATEGY_DAYS
+    args.walk_forward_window_days = TREND_STRATEGY_WALK_FORWARD_WINDOW_DAYS
+    return args
+
+
+def trend_strategy_args(strategy: str) -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.strategy = strategy
+    args.days = TREND_STRATEGY_DAYS
+    args.walk_forward_window_days = TREND_STRATEGY_WALK_FORWARD_WINDOW_DAYS
+    args.take_profit_pct = 0.0
+    args.stop_loss_pct = 0.0
+    args.min_signal_gap_minutes = 0
+    return args
+
+
+def with_timeframe(row: dict[str, Any], timeframe: str) -> dict[str, Any]:
+    updated = dict(row)
+    updated["timeframe"] = timeframe
+    return updated
+
+
+def sort_trend_strategy_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=trend_strategy_sort_key)
+
+
+def trend_strategy_sort_key(row: dict[str, Any]) -> tuple[float, int, float]:
+    average_return_pct = row["average_return_pct"]
+    max_drawdown_pct = row["max_drawdown_pct"]
+    return (
+        -(float(average_return_pct) if average_return_pct is not None else float("-inf")),
+        -int(row["positive_window_count"]),
+        float(max_drawdown_pct) if max_drawdown_pct is not None else float("inf"),
+    )
+
+
 def ichimoku_candidate_v1_args() -> argparse.Namespace:
     args = hold_tp_baseline_args()
     args.days = ICHIMOKU_DAYS
@@ -2362,6 +2469,14 @@ def strategy_signals(
         return ema_rsi_signals(candles)
     if strategy == "donchian":
         return donchian_signals(candles)
+    if strategy == "donchian_5m":
+        return donchian_signals(derive_timeframe_candles(candles, 5))
+    if strategy == "donchian_15m":
+        return donchian_signals(derive_timeframe_candles(candles, 15))
+    if strategy == "ema_trend_5m":
+        return ema_trend_signals(derive_timeframe_candles(candles, 5))
+    if strategy == "ema_trend_15m":
+        return ema_trend_signals(derive_timeframe_candles(candles, 15))
     if strategy == "ichimoku":
         return ichimoku_signals(candles)
     if strategy == "bollinger_rsi_and":
@@ -2534,16 +2649,36 @@ def aligned_mtf_trend(candles: list[Candle]) -> dict[str, bool]:
 
 
 def derive_five_minute_candles(candles: list[Candle]) -> list[Candle]:
-    grouped: dict[datetime, Candle] = {}
+    return derive_timeframe_candles(candles, 5)
+
+
+def derive_timeframe_candles(candles: list[Candle], timeframe_minutes: int) -> list[Candle]:
+    grouped: dict[datetime, list[Candle]] = {}
     for candle in candles:
-        bucket_ts = floor_to_five_minutes(parse_utc_datetime(candle.ts))
-        grouped[bucket_ts] = candle
-    return [grouped[bucket_ts] for bucket_ts in sorted(grouped)]
+        bucket_ts = floor_to_timeframe(parse_utc_datetime(candle.ts), timeframe_minutes)
+        grouped.setdefault(bucket_ts, []).append(candle)
+    derived = []
+    for bucket_ts in sorted(grouped):
+        bucket = grouped[bucket_ts]
+        last_candle = bucket[-1]
+        derived.append(Candle(
+            market=last_candle.market,
+            ts=last_candle.ts,
+            price=last_candle.price,
+            high=max(candle.high_price for candle in bucket),
+            low=min(candle.low_price for candle in bucket),
+        ))
+    return derived
+
+
+def floor_to_timeframe(value: datetime, timeframe_minutes: int) -> datetime:
+    value = value.astimezone(timezone.utc)
+    floored_minute = value.minute - (value.minute % timeframe_minutes)
+    return value.replace(minute=floored_minute, second=0, microsecond=0)
 
 
 def floor_to_five_minutes(value: datetime) -> datetime:
-    value = value.astimezone(timezone.utc)
-    return value.replace(minute=value.minute - (value.minute % 5), second=0, microsecond=0)
+    return floor_to_timeframe(value, 5)
 
 
 def ema_rsi_signals(candles: list[Candle]) -> list[dict[str, Any]]:
@@ -2577,6 +2712,28 @@ def donchian_signals(candles: list[Candle]) -> list[dict[str, Any]]:
             signals.append(signal_event(candles[index], "BUY"))
         elif price < exit_low:
             signals.append(signal_event(candles[index], "SELL"))
+    return signals
+
+
+def ema_trend_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    ema_fast = ema_series(prices, EMA_FAST)
+    ema_slow = ema_series(prices, EMA_SLOW)
+    signals = []
+    in_position = False
+    for index, candle in enumerate(candles):
+        current_fast = ema_fast[index]
+        current_slow = ema_slow[index]
+        if None in (current_fast, current_slow):
+            continue
+        entry_signal = current_fast > current_slow and candle.price > current_fast
+        exit_signal = current_fast < current_slow
+        if not in_position and entry_signal:
+            signals.append(signal_event(candle, "BUY"))
+            in_position = True
+        elif in_position and exit_signal:
+            signals.append(signal_event(candle, "SELL"))
+            in_position = False
     return signals
 
 
