@@ -47,6 +47,7 @@ STRATEGIES = (
     "rsi",
     "ema_rsi",
     "donchian",
+    "ichimoku",
     "bollinger_rsi_and",
     "bollinger_rsi_or",
     "bollinger_rsi_and_mtf",
@@ -70,6 +71,12 @@ EMA_RSI_BUY_THRESHOLD = 55.0
 EMA_RSI_SELL_THRESHOLD = 45.0
 DONCHIAN_ENTRY_CHANNEL = 20
 DONCHIAN_EXIT_CHANNEL = 10
+ICHIMOKU_TENKAN = 9
+ICHIMOKU_KIJUN = 26
+ICHIMOKU_SENKOU_B = 52
+ICHIMOKU_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
+ICHIMOKU_DAYS = 365
+ICHIMOKU_WALK_FORWARD_WINDOW_DAYS = 30
 
 
 @dataclass
@@ -77,6 +84,16 @@ class Candle:
     market: str
     ts: str
     price: float
+    high: float | None = None
+    low: float | None = None
+
+    @property
+    def high_price(self) -> float:
+        return self.price if self.high is None else self.high
+
+    @property
+    def low_price(self) -> float:
+        return self.price if self.low is None else self.low
 
 
 @dataclass
@@ -131,6 +148,9 @@ def main() -> None:
             return
         if args.compare_fixed_universes:
             print_fixed_universe_comparison(conn)
+            return
+        if args.compare_ichimoku:
+            print_ichimoku_comparison(conn)
             return
         if args.trade_attribution:
             print_trade_attribution(conn)
@@ -198,6 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-hold-tp", action="store_true")
     parser.add_argument("--compare-dynamic-universe-hold", action="store_true")
     parser.add_argument("--compare-fixed-universes", action="store_true")
+    parser.add_argument("--compare-ichimoku", action="store_true")
     parser.add_argument("--trade-attribution", action="store_true")
     parser.add_argument("--long-validation", action="store_true")
     parser.add_argument("--compare-rsi", action="store_true")
@@ -1510,6 +1531,78 @@ def print_fixed_universe_comparison(conn: sqlite3.Connection) -> None:
     Console(width=220).print(fixed_universe_table("Bottom 10 Fixed Universes", rows[-10:]))
 
 
+def print_ichimoku_comparison(conn: sqlite3.Connection) -> None:
+    rows = ichimoku_comparison_rows(conn)
+    table = Table(title="Ichimoku Strategy Family Comparison")
+    table.add_column("strategy")
+    table.add_column("trade_count", justify="right")
+    table.add_column("average_return_pct", justify="right")
+    table.add_column("median_return_pct", justify="right")
+    table.add_column("positive_window_count", justify="right")
+    table.add_column("negative_window_count", justify="right")
+    table.add_column("worst_window_return_pct", justify="right")
+    table.add_column("best_window_return_pct", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    for row in rows:
+        table.add_row(
+            row["strategy"],
+            str(row["trade_count"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            format_optional_float(row["average_hold_minutes"]),
+        )
+    Console(width=160).print(table)
+
+
+def ichimoku_comparison_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    return [
+        summarize_strategy_family("candidate_v1", run_walk_forward_summaries(conn, ichimoku_candidate_v1_args(), list(ICHIMOKU_MARKETS))),
+        summarize_strategy_family("ichimoku", run_walk_forward_summaries(conn, ichimoku_args(), list(ICHIMOKU_MARKETS))),
+    ]
+
+
+def ichimoku_candidate_v1_args() -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.days = ICHIMOKU_DAYS
+    args.walk_forward_window_days = ICHIMOKU_WALK_FORWARD_WINDOW_DAYS
+    return args
+
+
+def ichimoku_args() -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.strategy = "ichimoku"
+    args.days = ICHIMOKU_DAYS
+    args.walk_forward_window_days = ICHIMOKU_WALK_FORWARD_WINDOW_DAYS
+    return args
+
+
+def summarize_strategy_family(label: str, summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    walk_forward_summary = summarize_walk_forward(summaries)
+    hold_values = [
+        float(summary["average_hold_minutes"])
+        for summary in summaries
+        if summary["average_hold_minutes"] is not None
+    ]
+    return {
+        "strategy": label,
+        "trade_count": walk_forward_summary["total_trade_count"],
+        "average_return_pct": walk_forward_summary["average_return_pct"],
+        "median_return_pct": walk_forward_summary["median_return_pct"],
+        "positive_window_count": walk_forward_summary["positive_window_count"],
+        "negative_window_count": walk_forward_summary["negative_window_count"],
+        "worst_window_return_pct": walk_forward_summary["worst_window_return_pct"],
+        "best_window_return_pct": walk_forward_summary["best_window_return_pct"],
+        "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
+        "average_hold_minutes": mean(hold_values) if hold_values else None,
+    }
+
+
 def print_trade_attribution(conn: sqlite3.Connection) -> None:
     summaries = candidate_v1_walk_forward_summaries(conn)
     closed_trades = closed_trades_from_summaries(summaries)
@@ -2207,9 +2300,10 @@ def load_candles(
     if window_end is not None:
         upper_bound_sql = "AND candle_date_time_utc < ?"
         params.append(format_utc(window_end))
+    price_columns = candle_price_columns(conn)
     rows = conn.execute(
         f"""
-        SELECT candle_date_time_utc, trade_price
+        SELECT {price_columns}
         FROM candles
         WHERE market = ?
           AND interval = ?
@@ -2228,8 +2322,21 @@ def load_candles(
         if ts in seen_timestamps:
             continue
         seen_timestamps.add(ts)
-        candles.append(Candle(market=market, ts=ts, price=float(row["trade_price"])))
+        candles.append(Candle(
+            market=market,
+            ts=ts,
+            price=float(row["trade_price"]),
+            high=float(row["high_price"] if row["high_price"] is not None else row["trade_price"]),
+            low=float(row["low_price"] if row["low_price"] is not None else row["trade_price"]),
+        ))
     return candles
+
+
+def candle_price_columns(conn: sqlite3.Connection) -> str:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(candles)").fetchall()}
+    if {"high_price", "low_price"}.issubset(columns):
+        return "candle_date_time_utc, trade_price, high_price, low_price"
+    return "candle_date_time_utc, trade_price, trade_price AS high_price, trade_price AS low_price"
 
 
 def validate_strategy_interval(strategy: str, interval: str) -> None:
@@ -2255,6 +2362,8 @@ def strategy_signals(
         return ema_rsi_signals(candles)
     if strategy == "donchian":
         return donchian_signals(candles)
+    if strategy == "ichimoku":
+        return ichimoku_signals(candles)
     if strategy == "bollinger_rsi_and":
         return bollinger_rsi_signals(
             candles,
@@ -2469,6 +2578,47 @@ def donchian_signals(candles: list[Candle]) -> list[dict[str, Any]]:
         elif price < exit_low:
             signals.append(signal_event(candles[index], "SELL"))
     return signals
+
+
+def ichimoku_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+    tenkan = ichimoku_midpoint_series(candles, ICHIMOKU_TENKAN)
+    kijun = ichimoku_midpoint_series(candles, ICHIMOKU_KIJUN)
+    senkou_b = ichimoku_midpoint_series(candles, ICHIMOKU_SENKOU_B)
+    signals = []
+    in_position = False
+    for index, candle in enumerate(candles):
+        current_tenkan = tenkan[index]
+        current_kijun = kijun[index]
+        current_senkou_b = senkou_b[index]
+        if None in (current_tenkan, current_kijun, current_senkou_b):
+            continue
+        senkou_a = (current_tenkan + current_kijun) / 2
+        cloud_top = max(senkou_a, current_senkou_b)
+        cloud_bullish = senkou_a > current_senkou_b
+        long_entry = candle.price > cloud_top and current_tenkan > current_kijun and cloud_bullish
+        tenkan_cross_below = False
+        if index > 0 and tenkan[index - 1] is not None and kijun[index - 1] is not None:
+            tenkan_cross_below = tenkan[index - 1] >= kijun[index - 1] and current_tenkan < current_kijun
+        exit_signal = tenkan_cross_below or candle.price < current_kijun
+        if not in_position and long_entry:
+            signals.append(signal_event(candle, "BUY"))
+            in_position = True
+        elif in_position and exit_signal:
+            signals.append(signal_event(candle, "SELL"))
+            in_position = False
+    return signals
+
+
+def ichimoku_midpoint_series(candles: list[Candle], period: int) -> list[float | None]:
+    series: list[float | None] = [None] * len(candles)
+    if len(candles) < period:
+        return series
+    for index in range(period - 1, len(candles)):
+        window = candles[index - period + 1:index + 1]
+        highest_high = max(candle.high_price for candle in window)
+        lowest_low = min(candle.low_price for candle in window)
+        series[index] = (highest_high + lowest_low) / 2
+    return series
 
 
 def rsi_series(values: list[float], period: int) -> list[float | None]:
