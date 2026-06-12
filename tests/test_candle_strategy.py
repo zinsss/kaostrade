@@ -29,6 +29,10 @@ from app.backtest.candle_strategy import (
     configured_markets_with_candles,
     fixed_universe_args,
     fixed_universes,
+    ichimoku_args,
+    ichimoku_candidate_v1_args,
+    ichimoku_midpoint_series,
+    ichimoku_signals,
     classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
@@ -50,6 +54,7 @@ from app.backtest.candle_strategy import (
     summarize_hold_tp_result,
     summarize_market_subset,
     run_dynamic_universe_summary,
+    summarize_strategy_family,
     summarize_walk_forward,
     validate_strategy_interval,
     worst_trades,
@@ -63,6 +68,78 @@ def ts(minutes: int) -> str:
 
 def candle(minutes: int, price: float | None = None) -> Candle:
     return Candle(market="KRW-BTC", ts=ts(minutes), price=float(price if price is not None else minutes + 1))
+
+
+def ohlc_candle(minutes: int, close: float, high: float | None = None, low: float | None = None) -> Candle:
+    return Candle(
+        market="KRW-BTC",
+        ts=ts(minutes),
+        price=close,
+        high=close if high is None else high,
+        low=close if low is None else low,
+    )
+
+
+class IchimokuStrategyTests(unittest.TestCase):
+    def test_midpoint_series_uses_highs_and_lows(self) -> None:
+        candles = [
+            ohlc_candle(0, 10.0, high=11.0, low=9.0),
+            ohlc_candle(1, 12.0, high=14.0, low=10.0),
+            ohlc_candle(2, 13.0, high=15.0, low=12.0),
+        ]
+
+        series = ichimoku_midpoint_series(candles, 3)
+
+        self.assertEqual(series[:2], [None, None])
+        self.assertEqual(series[2], 12.0)
+
+    def test_ichimoku_signals_buy_above_bullish_cloud_and_sell_on_kijun_break(self) -> None:
+        candles = []
+        for index in range(60):
+            close = 100.0 + index
+            candles.append(ohlc_candle(index, close, high=close + 1.0, low=close - 1.0))
+        candles.append(ohlc_candle(60, 120.0, high=121.0, low=119.0))
+        candles.append(ohlc_candle(61, 90.0, high=91.0, low=89.0))
+
+        signals = ichimoku_signals(candles)
+
+        self.assertGreaterEqual(len(signals), 2)
+        self.assertEqual(signals[0]["signal"], "BUY")
+        self.assertEqual(signals[-1]["signal"], "SELL")
+
+    def test_ichimoku_comparison_args_use_candidate_v1_universe_and_365_days(self) -> None:
+        candidate_args = ichimoku_candidate_v1_args()
+        ichimoku_only_args = ichimoku_args()
+
+        self.assertEqual(candidate_args.strategy, "bollinger_rsi_and_mtf")
+        self.assertEqual(ichimoku_only_args.strategy, "ichimoku")
+        self.assertEqual(candidate_args.days, 365)
+        self.assertEqual(ichimoku_only_args.days, 365)
+        self.assertEqual(candidate_args.walk_forward_window_days, 30)
+        self.assertEqual(ichimoku_only_args.walk_forward_window_days, 30)
+        self.assertEqual(candidate_args.take_profit_pct, 0.5)
+        self.assertEqual(ichimoku_only_args.take_profit_pct, 0.5)
+        self.assertEqual(ichimoku_only_args.stop_loss_pct, 0)
+
+    def test_summarize_strategy_family_uses_walk_forward_metrics(self) -> None:
+        row = summarize_strategy_family(
+            "ichimoku",
+            [
+                window_summary("a", "b", 1.0, 2, 0.3),
+                window_summary("b", "c", -0.5, 4, 0.8),
+            ],
+        )
+
+        self.assertEqual(row["strategy"], "ichimoku")
+        self.assertEqual(row["trade_count"], 6)
+        self.assertAlmostEqual(row["average_return_pct"], 0.25)
+        self.assertEqual(row["median_return_pct"], 0.25)
+        self.assertEqual(row["positive_window_count"], 1)
+        self.assertEqual(row["negative_window_count"], 1)
+        self.assertEqual(row["worst_window_return_pct"], -0.5)
+        self.assertEqual(row["best_window_return_pct"], 1.0)
+        self.assertEqual(row["max_drawdown_pct"], 0.8)
+        self.assertEqual(row["average_hold_minutes"], 12.5)
 
 
 class MultiTimeframeTrendTests(unittest.TestCase):
