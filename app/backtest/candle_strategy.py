@@ -48,6 +48,7 @@ STRATEGIES = (
     "ema_rsi",
     "donchian",
     "ichimoku",
+    "ichimoku_strict_15m",
     "donchian_5m",
     "donchian_15m",
     "ema_trend_5m",
@@ -81,6 +82,11 @@ ICHIMOKU_SENKOU_B = 52
 ICHIMOKU_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
 ICHIMOKU_DAYS = 365
 ICHIMOKU_WALK_FORWARD_WINDOW_DAYS = 30
+ICHIMOKU_STRICT_TAKE_PROFIT_PCTS = (1.0, 2.0, 3.0)
+ICHIMOKU_STRICT_STOP_LOSS_PCTS = (0.8, 1.2, 1.5)
+ICHIMOKU_STRICT_MAX_HOLD_HOURS = (12, 24, 48)
+ICHIMOKU_STRICT_CLOUD_THICKNESS_PCT = 0.2
+ICHIMOKU_STRICT_MAX_DISTANCE_ABOVE_CLOUD_PCT = 2.0
 TREND_STRATEGY_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
 TREND_STRATEGY_DAYS = 365
 TREND_STRATEGY_WALK_FORWARD_WINDOW_DAYS = 30
@@ -165,6 +171,9 @@ def main() -> None:
         if args.compare_ichimoku:
             print_ichimoku_comparison(conn)
             return
+        if args.compare_ichimoku_strict:
+            print_ichimoku_strict_comparison(conn)
+            return
         if args.compare_trend_strategies:
             print_trend_strategy_comparison(conn)
             return
@@ -235,6 +244,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-dynamic-universe-hold", action="store_true")
     parser.add_argument("--compare-fixed-universes", action="store_true")
     parser.add_argument("--compare-ichimoku", action="store_true")
+    parser.add_argument("--compare-ichimoku-strict", action="store_true")
     parser.add_argument("--compare-trend-strategies", action="store_true")
     parser.add_argument("--trade-attribution", action="store_true")
     parser.add_argument("--long-validation", action="store_true")
@@ -1584,6 +1594,95 @@ def ichimoku_comparison_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
+def print_ichimoku_strict_comparison(conn: sqlite3.Connection) -> None:
+    rows = sort_ichimoku_strict_rows(ichimoku_strict_comparison_rows(conn))
+    table = Table(title="Strict Ichimoku 15m Comparison")
+    table.add_column("label")
+    table.add_column("trade_count", justify="right")
+    table.add_column("average_return_pct", justify="right")
+    table.add_column("median_return_pct", justify="right")
+    table.add_column("positive_window_count", justify="right")
+    table.add_column("negative_window_count", justify="right")
+    table.add_column("worst_window_return_pct", justify="right")
+    table.add_column("best_window_return_pct", justify="right")
+    table.add_column("max_drawdown_pct", justify="right")
+    table.add_column("average_hold_minutes", justify="right")
+    for row in rows:
+        table.add_row(
+            row["label"],
+            str(row["trade_count"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            format_optional_float(row["average_hold_minutes"]),
+        )
+    Console(width=180).print(table)
+
+
+def ichimoku_strict_comparison_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = [
+        summarize_ichimoku_strict_result(
+            "candidate_v1",
+            run_walk_forward_summaries(conn, ichimoku_candidate_v1_args(), list(ICHIMOKU_MARKETS)),
+        )
+    ]
+    for take_profit_pct in ICHIMOKU_STRICT_TAKE_PROFIT_PCTS:
+        for stop_loss_pct in ICHIMOKU_STRICT_STOP_LOSS_PCTS:
+            for max_hold_hours in ICHIMOKU_STRICT_MAX_HOLD_HOURS:
+                label = f"ichimoku_strict_15m_tp_{take_profit_pct:g}_sl_{stop_loss_pct:g}_hold_{max_hold_hours}h"
+                rows.append(
+                    summarize_ichimoku_strict_result(
+                        label,
+                        run_walk_forward_summaries(
+                            conn,
+                            ichimoku_strict_args(take_profit_pct, stop_loss_pct, max_hold_hours),
+                            list(ICHIMOKU_MARKETS),
+                        ),
+                    )
+                )
+    return rows
+
+
+def ichimoku_strict_args(
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.strategy = "ichimoku_strict_15m"
+    args.days = ICHIMOKU_DAYS
+    args.walk_forward_window_days = ICHIMOKU_WALK_FORWARD_WINDOW_DAYS
+    args.take_profit_pct = take_profit_pct
+    args.stop_loss_pct = stop_loss_pct
+    args.max_hold_hours = max_hold_hours
+    args.min_signal_gap_minutes = 0
+    return args
+
+
+def summarize_ichimoku_strict_result(label: str, summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    row = summarize_strategy_family(label, summaries)
+    row["label"] = label
+    return row
+
+
+def sort_ichimoku_strict_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=ichimoku_strict_sort_key)
+
+
+def ichimoku_strict_sort_key(row: dict[str, Any]) -> tuple[float, int, float]:
+    average_return_pct = row["average_return_pct"]
+    max_drawdown_pct = row["max_drawdown_pct"]
+    return (
+        -(float(average_return_pct) if average_return_pct is not None else float("-inf")),
+        -int(row["positive_window_count"]),
+        float(max_drawdown_pct) if max_drawdown_pct is not None else float("inf"),
+    )
+
+
 def print_trend_strategy_comparison(conn: sqlite3.Connection) -> None:
     rows = sort_trend_strategy_rows(trend_strategy_comparison_rows(conn))
     table = Table(title="Multi-Timeframe Trend Strategy Comparison")
@@ -2479,6 +2578,8 @@ def strategy_signals(
         return ema_trend_signals(derive_timeframe_candles(candles, 15))
     if strategy == "ichimoku":
         return ichimoku_signals(candles)
+    if strategy == "ichimoku_strict_15m":
+        return ichimoku_strict_signals(derive_timeframe_candles(candles, 15))
     if strategy == "bollinger_rsi_and":
         return bollinger_rsi_signals(
             candles,
@@ -2753,6 +2854,49 @@ def ichimoku_signals(candles: list[Candle]) -> list[dict[str, Any]]:
         cloud_top = max(senkou_a, current_senkou_b)
         cloud_bullish = senkou_a > current_senkou_b
         long_entry = candle.price > cloud_top and current_tenkan > current_kijun and cloud_bullish
+        tenkan_cross_below = False
+        if index > 0 and tenkan[index - 1] is not None and kijun[index - 1] is not None:
+            tenkan_cross_below = tenkan[index - 1] >= kijun[index - 1] and current_tenkan < current_kijun
+        exit_signal = tenkan_cross_below or candle.price < current_kijun
+        if not in_position and long_entry:
+            signals.append(signal_event(candle, "BUY"))
+            in_position = True
+        elif in_position and exit_signal:
+            signals.append(signal_event(candle, "SELL"))
+            in_position = False
+    return signals
+
+
+def ichimoku_strict_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+    tenkan = ichimoku_midpoint_series(candles, ICHIMOKU_TENKAN)
+    kijun = ichimoku_midpoint_series(candles, ICHIMOKU_KIJUN)
+    senkou_b = ichimoku_midpoint_series(candles, ICHIMOKU_SENKOU_B)
+    signals = []
+    in_position = False
+    for index, candle in enumerate(candles):
+        current_tenkan = tenkan[index]
+        current_kijun = kijun[index]
+        current_senkou_b = senkou_b[index]
+        if None in (current_tenkan, current_kijun, current_senkou_b):
+            continue
+        senkou_a = (current_tenkan + current_kijun) / 2
+        cloud_top = max(senkou_a, current_senkou_b)
+        cloud_bottom = min(senkou_a, current_senkou_b)
+        cloud_bullish = senkou_a > current_senkou_b
+        cloud_thickness_pct = 0.0
+        if cloud_bottom > 0:
+            cloud_thickness_pct = (cloud_top - cloud_bottom) / cloud_bottom * 100
+        distance_above_cloud_pct = 0.0
+        if cloud_top > 0:
+            distance_above_cloud_pct = (candle.price - cloud_top) / cloud_top * 100
+        long_entry = (
+            candle.price > cloud_top
+            and current_tenkan > current_kijun
+            and cloud_bullish
+            and candle.price > current_kijun
+            and cloud_thickness_pct >= ICHIMOKU_STRICT_CLOUD_THICKNESS_PCT
+            and distance_above_cloud_pct <= ICHIMOKU_STRICT_MAX_DISTANCE_ABOVE_CLOUD_PCT
+        )
         tenkan_cross_below = False
         if index > 0 and tenkan[index - 1] is not None and kijun[index - 1] is not None:
             tenkan_cross_below = tenkan[index - 1] >= kijun[index - 1] and current_tenkan < current_kijun
