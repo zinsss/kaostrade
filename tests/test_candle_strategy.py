@@ -33,6 +33,9 @@ from app.backtest.candle_strategy import (
     ichimoku_candidate_v1_args,
     ichimoku_midpoint_series,
     ichimoku_signals,
+    ichimoku_strict_args,
+    ichimoku_strict_signals,
+    sort_ichimoku_strict_rows,
     classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
@@ -145,6 +148,58 @@ class IchimokuStrategyTests(unittest.TestCase):
         self.assertEqual(row["best_window_return_pct"], 1.0)
         self.assertEqual(row["max_drawdown_pct"], 0.8)
         self.assertEqual(row["average_hold_minutes"], 12.5)
+
+    def test_ichimoku_strict_args_use_requested_risk_controls(self) -> None:
+        strict_args = ichimoku_strict_args(2.0, 1.2, 24)
+
+        self.assertEqual(strict_args.strategy, "ichimoku_strict_15m")
+        self.assertEqual(strict_args.days, 365)
+        self.assertEqual(strict_args.walk_forward_window_days, 30)
+        self.assertEqual(strict_args.take_profit_pct, 2.0)
+        self.assertEqual(strict_args.stop_loss_pct, 1.2)
+        self.assertEqual(strict_args.max_hold_hours, 24)
+        self.assertEqual(strict_args.min_signal_gap_minutes, 0)
+
+    def test_ichimoku_strict_signals_require_cloud_filters(self) -> None:
+        candles = [ohlc_candle(0, 100.0), ohlc_candle(1, 106.0)]
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.ichimoku_midpoint_series",
+            side_effect=([None, 110.0], [None, 100.0], [None, 90.0]),
+        ):
+            signals = ichimoku_strict_signals(candles)
+
+        self.assertEqual([signal["signal"] for signal in signals], ["BUY"])
+
+    def test_ichimoku_strict_signals_reject_price_too_far_above_cloud(self) -> None:
+        candles = [ohlc_candle(0, 100.0), ohlc_candle(1, 108.0)]
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.ichimoku_midpoint_series",
+            side_effect=([None, 110.0], [None, 100.0], [None, 90.0]),
+        ):
+            signals = ichimoku_strict_signals(candles)
+
+        self.assertEqual(signals, [])
+
+    def test_ichimoku_strict_signals_reject_thin_cloud(self) -> None:
+        candles = [ohlc_candle(0, 100.0), ohlc_candle(1, 105.05)]
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.ichimoku_midpoint_series",
+            side_effect=([None, 110.0], [None, 100.0], [None, 104.9]),
+        ):
+            signals = ichimoku_strict_signals(candles)
+
+        self.assertEqual(signals, [])
+
+    def test_ichimoku_strict_sort_order(self) -> None:
+        rows = [
+            {"label": "low", "average_return_pct": 0.1, "positive_window_count": 3, "max_drawdown_pct": 0.1},
+            {"label": "better_positive", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.5},
+            {"label": "lower_drawdown", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.2},
+        ]
+
+        sorted_rows = sort_ichimoku_strict_rows(rows)
+
+        self.assertEqual([row["label"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
 
 
 class TrendStrategyResearchTests(unittest.TestCase):
