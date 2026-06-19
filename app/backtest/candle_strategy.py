@@ -101,6 +101,23 @@ MACD_TREND_WALK_FORWARD_WINDOW_DAYS = 30
 MACD_TREND_TAKE_PROFIT_PCTS = (1.0, 2.0, 3.0)
 MACD_TREND_STOP_LOSS_PCTS = (0.8, 1.2, 1.5)
 MACD_TREND_MAX_HOLD_HOURS = (24, 48, 72)
+BOLLINGER_SQUEEZE_VOLUME_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
+BOLLINGER_SQUEEZE_VOLUME_DAYS = 365
+BOLLINGER_SQUEEZE_VOLUME_WALK_FORWARD_WINDOW_DAYS = 30
+BOLLINGER_SQUEEZE_VOLUME_TIMEFRAMES = (5, 15)
+BOLLINGER_SQUEEZE_VOLUME_MULTIPLIERS = (2.0, 2.5, 3.0)
+BOLLINGER_SQUEEZE_VOLUME_MAX_RECENT_PUMP_PCTS = (3.0, 5.0, 8.0)
+BOLLINGER_SQUEEZE_VOLUME_TAKE_PROFIT_PCTS = (1.0, 1.5, 2.0)
+BOLLINGER_SQUEEZE_VOLUME_STOP_LOSS_PCTS = (0.8, 1.2)
+BOLLINGER_SQUEEZE_VOLUME_MAX_HOLD_HOURS = (6, 12, 24)
+BOLLINGER_SQUEEZE_PERIOD = 20
+BOLLINGER_SQUEEZE_STDDEV = 2.0
+BOLLINGER_SQUEEZE_BANDWIDTH_LOOKBACK = 100
+BOLLINGER_SQUEEZE_BANDWIDTH_PERCENTILE = 25
+BOLLINGER_SQUEEZE_EMA_PERIOD = 20
+BOLLINGER_SQUEEZE_EMA_SLOPE_LOOKBACK = 3
+BOLLINGER_SQUEEZE_VOLUME_MA_PERIOD = 20
+BOLLINGER_SQUEEZE_RECENT_PUMP_LOOKBACK = 6
 TREND_STRATEGY_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
 TREND_STRATEGY_DAYS = 365
 TREND_STRATEGY_WALK_FORWARD_WINDOW_DAYS = 30
@@ -202,6 +219,9 @@ def main() -> None:
         if args.compare_volume_ema:
             print_volume_ema_comparison(conn)
             return
+        if args.compare_bollinger_squeeze_volume:
+            print_bollinger_squeeze_volume_comparison(conn)
+            return
         if args.compare_trend_strategies:
             print_trend_strategy_comparison(conn)
             return
@@ -275,6 +295,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-ichimoku-strict", action="store_true")
     parser.add_argument("--compare-macd-trend", action="store_true")
     parser.add_argument("--compare-volume-ema", action="store_true")
+    parser.add_argument("--compare-bollinger-squeeze-volume", action="store_true")
     parser.add_argument("--compare-trend-strategies", action="store_true")
     parser.add_argument("--trade-attribution", action="store_true")
     parser.add_argument("--long-validation", action="store_true")
@@ -1874,6 +1895,270 @@ def sort_volume_ema_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=trend_strategy_sort_key)
 
 
+def print_bollinger_squeeze_volume_comparison(conn: sqlite3.Connection) -> None:
+    baseline = bollinger_squeeze_volume_candidate_v1_row(conn)
+    squeeze_rows = sort_bollinger_squeeze_volume_rows(bollinger_squeeze_volume_rows(conn))
+    best_squeeze = squeeze_rows[0] if squeeze_rows else None
+
+    baseline_table = Table(title="Candidate v1 Baseline")
+    add_bollinger_squeeze_volume_columns(baseline_table)
+    add_bollinger_squeeze_volume_row(baseline_table, baseline)
+
+    top_table = Table(title="Top 10 Bollinger Squeeze + Volume Rows")
+    add_bollinger_squeeze_volume_columns(top_table)
+    for row in squeeze_rows[:10]:
+        add_bollinger_squeeze_volume_row(top_table, row)
+
+    bottom_table = Table(title="Bottom 10 Bollinger Squeeze + Volume Rows")
+    add_bollinger_squeeze_volume_columns(bottom_table)
+    for row in squeeze_rows[-10:]:
+        add_bollinger_squeeze_volume_row(bottom_table, row)
+
+    console = Console(width=420)
+    console.print(baseline_table)
+    console.print(top_table)
+    console.print(bottom_table)
+    console.print(bollinger_squeeze_volume_verdict(baseline, best_squeeze))
+
+
+def add_bollinger_squeeze_volume_columns(table: Table) -> None:
+    table.add_column("label", no_wrap=True)
+    table.add_column("timeframe", no_wrap=True, justify="right")
+    table.add_column("trade_count", no_wrap=True, justify="right")
+    table.add_column("average_return_pct", no_wrap=True, justify="right")
+    table.add_column("median_return_pct", no_wrap=True, justify="right")
+    table.add_column("positive_window_count", no_wrap=True, justify="right")
+    table.add_column("negative_window_count", no_wrap=True, justify="right")
+    table.add_column("worst_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("best_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("max_drawdown_pct", no_wrap=True, justify="right")
+    table.add_column("average_hold_minutes", no_wrap=True, justify="right")
+
+
+def add_bollinger_squeeze_volume_row(table: Table, row: dict[str, Any]) -> None:
+    table.add_row(
+        row["label"],
+        row["timeframe"],
+        str(row["trade_count"]),
+        format_optional_float(row["average_return_pct"]),
+        format_optional_float(row["median_return_pct"]),
+        str(row["positive_window_count"]),
+        str(row["negative_window_count"]),
+        format_optional_float(row["worst_window_return_pct"]),
+        format_optional_float(row["best_window_return_pct"]),
+        format_optional_float(row["max_drawdown_pct"]),
+        format_optional_float(row["average_hold_minutes"]),
+    )
+
+
+def bollinger_squeeze_volume_verdict(
+    baseline: dict[str, Any],
+    best_squeeze: dict[str, Any] | None,
+) -> str:
+    if best_squeeze is None:
+        return "No squeeze-volume rows were generated."
+    beats_baseline = trend_strategy_sort_key(best_squeeze) < trend_strategy_sort_key(baseline)
+    if beats_baseline:
+        return f"Best squeeze-volume row beats candidate_v1: {best_squeeze['label']}"
+    return f"No squeeze-volume row beats candidate_v1. Best squeeze-volume row: {best_squeeze['label']}"
+
+
+def bollinger_squeeze_volume_candidate_v1_row(conn: sqlite3.Connection) -> dict[str, Any]:
+    return summarize_bollinger_squeeze_volume_result(
+        label="candidate_v1",
+        timeframe="1m",
+        summaries=run_walk_forward_summaries(
+            conn,
+            bollinger_squeeze_volume_candidate_v1_args(),
+            list(BOLLINGER_SQUEEZE_VOLUME_MARKETS),
+        ),
+    )
+
+
+def bollinger_squeeze_volume_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    windows = walk_forward_windows(
+        BOLLINGER_SQUEEZE_VOLUME_DAYS,
+        BOLLINGER_SQUEEZE_VOLUME_WALK_FORWARD_WINDOW_DAYS,
+    )
+    window_inputs_by_timeframe = {
+        timeframe: [
+            build_bollinger_squeeze_volume_window_input(conn, timeframe, window_start, window_end)
+            for window_start, window_end in windows
+        ]
+        for timeframe in BOLLINGER_SQUEEZE_VOLUME_TIMEFRAMES
+    }
+    rows = []
+    for timeframe in BOLLINGER_SQUEEZE_VOLUME_TIMEFRAMES:
+        for volume_multiplier in BOLLINGER_SQUEEZE_VOLUME_MULTIPLIERS:
+            for max_recent_pump_pct in BOLLINGER_SQUEEZE_VOLUME_MAX_RECENT_PUMP_PCTS:
+                signal_window_inputs = [
+                    build_bollinger_squeeze_volume_signal_window_input(
+                        window_input,
+                        volume_multiplier=volume_multiplier,
+                        max_recent_pump_pct=max_recent_pump_pct,
+                    )
+                    for window_input in window_inputs_by_timeframe[timeframe]
+                ]
+                for take_profit_pct in BOLLINGER_SQUEEZE_VOLUME_TAKE_PROFIT_PCTS:
+                    for stop_loss_pct in BOLLINGER_SQUEEZE_VOLUME_STOP_LOSS_PCTS:
+                        for max_hold_hours in BOLLINGER_SQUEEZE_VOLUME_MAX_HOLD_HOURS:
+                            summaries = [
+                                run_bollinger_squeeze_volume_window_summary(
+                                    window_input,
+                                    take_profit_pct=take_profit_pct,
+                                    stop_loss_pct=stop_loss_pct,
+                                    max_hold_hours=max_hold_hours,
+                                )
+                                for window_input in signal_window_inputs
+                            ]
+                            rows.append(summarize_bollinger_squeeze_volume_result(
+                                label=bollinger_squeeze_volume_label(
+                                    timeframe,
+                                    volume_multiplier,
+                                    max_recent_pump_pct,
+                                    take_profit_pct,
+                                    stop_loss_pct,
+                                    max_hold_hours,
+                                ),
+                                timeframe=f"{timeframe}m",
+                                summaries=summaries,
+                            ))
+    return rows
+
+
+def build_bollinger_squeeze_volume_window_input(
+    conn: sqlite3.Connection,
+    timeframe: int,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, Any]:
+    candles_by_market = {}
+    for market in BOLLINGER_SQUEEZE_VOLUME_MARKETS:
+        one_minute_candles = load_candles(
+            conn,
+            market,
+            "1m",
+            BOLLINGER_SQUEEZE_VOLUME_DAYS,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        candles_by_market[market] = derive_timeframe_candles(one_minute_candles, timeframe)
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "markets": list(BOLLINGER_SQUEEZE_VOLUME_MARKETS),
+        "timeframe": timeframe,
+        "candles_by_market": candles_by_market,
+        "final_prices": {
+            market: candles[-1].price
+            for market, candles in candles_by_market.items()
+            if candles
+        },
+    }
+
+
+def build_bollinger_squeeze_volume_signal_window_input(
+    window_input: dict[str, Any],
+    volume_multiplier: float,
+    max_recent_pump_pct: float,
+) -> dict[str, Any]:
+    signals_by_market = {
+        market: bollinger_squeeze_volume_signals(
+            candles,
+            volume_spike_multiplier=volume_multiplier,
+            max_recent_pump_pct=max_recent_pump_pct,
+        )
+        for market, candles in window_input["candles_by_market"].items()
+    }
+    return {
+        "window_start": window_input["window_start"],
+        "window_end": window_input["window_end"],
+        "markets": window_input["markets"],
+        "events": build_price_events(window_input["candles_by_market"], signals_by_market),
+        "final_prices": window_input["final_prices"],
+        "raw_signal_count": sum(len(signals) for signals in signals_by_market.values()),
+        "accepted_signal_count": sum(len(signals) for signals in signals_by_market.values()),
+    }
+
+
+def run_bollinger_squeeze_volume_window_summary(
+    signal_window_input: dict[str, Any],
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> dict[str, Any]:
+    summary_args = bollinger_squeeze_volume_args(take_profit_pct, stop_loss_pct, max_hold_hours)
+    return run_hold_tp_window_summary(signal_window_input, summary_args)
+
+
+def bollinger_squeeze_volume_candidate_v1_args() -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.days = BOLLINGER_SQUEEZE_VOLUME_DAYS
+    args.walk_forward_window_days = BOLLINGER_SQUEEZE_VOLUME_WALK_FORWARD_WINDOW_DAYS
+    return args
+
+
+def bollinger_squeeze_volume_args(
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.strategy = "bollinger_squeeze_volume"
+    args.days = BOLLINGER_SQUEEZE_VOLUME_DAYS
+    args.walk_forward_window_days = BOLLINGER_SQUEEZE_VOLUME_WALK_FORWARD_WINDOW_DAYS
+    args.take_profit_pct = take_profit_pct
+    args.stop_loss_pct = stop_loss_pct
+    args.max_hold_hours = max_hold_hours
+    args.min_signal_gap_minutes = 0
+    return args
+
+
+def summarize_bollinger_squeeze_volume_result(
+    label: str,
+    timeframe: str,
+    summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    walk_forward_summary = summarize_walk_forward(summaries)
+    average_hold_values = [
+        float(summary["average_hold_minutes"])
+        for summary in summaries
+        if summary["average_hold_minutes"] is not None
+    ]
+    return {
+        "label": label,
+        "timeframe": timeframe,
+        "trade_count": walk_forward_summary["total_trade_count"],
+        "average_return_pct": walk_forward_summary["average_return_pct"],
+        "median_return_pct": walk_forward_summary["median_return_pct"],
+        "positive_window_count": walk_forward_summary["positive_window_count"],
+        "negative_window_count": walk_forward_summary["negative_window_count"],
+        "worst_window_return_pct": walk_forward_summary["worst_window_return_pct"],
+        "best_window_return_pct": walk_forward_summary["best_window_return_pct"],
+        "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
+        "average_hold_minutes": mean(average_hold_values) if average_hold_values else None,
+    }
+
+
+def bollinger_squeeze_volume_label(
+    timeframe: int,
+    volume_multiplier: float,
+    max_recent_pump_pct: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> str:
+    return (
+        f"squeeze_volume_{timeframe}m_vol_{volume_multiplier:g}x"
+        f"_pump_{max_recent_pump_pct:g}_tp_{take_profit_pct:g}"
+        f"_sl_{stop_loss_pct:g}_hold_{max_hold_hours}h"
+    )
+
+
+def sort_bollinger_squeeze_volume_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=trend_strategy_sort_key)
+
+
 def print_trend_strategy_comparison(conn: sqlite3.Connection) -> None:
     rows = sort_trend_strategy_rows(trend_strategy_comparison_rows(conn))
     table = Table(title="Multi-Timeframe Trend Strategy Comparison")
@@ -2872,6 +3157,150 @@ def has_volume_spike(
     if len(prior_volumes) < lookback:
         return False
     return current_volume >= mean(prior_volumes) * multiplier
+
+
+def bollinger_squeeze_volume_signals(
+    candles: list[Candle],
+    volume_spike_multiplier: float,
+    max_recent_pump_pct: float,
+) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    middle, upper, lower = bollinger_band_series(
+        prices,
+        period=BOLLINGER_SQUEEZE_PERIOD,
+        stddev=BOLLINGER_SQUEEZE_STDDEV,
+    )
+    bandwidth = bollinger_bandwidth_pct_series(middle, upper, lower)
+    ema = ema_series(prices, BOLLINGER_SQUEEZE_EMA_PERIOD)
+    signals = []
+
+    for index, candle in enumerate(candles):
+        current_middle = middle[index]
+        current_upper = upper[index]
+        current_bandwidth = bandwidth[index]
+        current_ema = ema[index]
+        if None in (current_middle, current_upper, current_bandwidth, current_ema):
+            continue
+
+        if candle.price < current_ema:
+            signals.append(signal_event(candle, "SELL"))
+            continue
+
+        if not has_low_bandwidth_percentile(
+            bandwidth,
+            index,
+            lookback=BOLLINGER_SQUEEZE_BANDWIDTH_LOOKBACK,
+            percentile=BOLLINGER_SQUEEZE_BANDWIDTH_PERCENTILE,
+        ):
+            continue
+        if not ema_slope_positive(ema, index, BOLLINGER_SQUEEZE_EMA_SLOPE_LOOKBACK):
+            continue
+        if not has_volume_ma_spike(candles, index, BOLLINGER_SQUEEZE_VOLUME_MA_PERIOD, volume_spike_multiplier):
+            continue
+        if recent_return_pct(prices, index, BOLLINGER_SQUEEZE_RECENT_PUMP_LOOKBACK) > max_recent_pump_pct:
+            continue
+        if candle.price > current_upper:
+            signals.append(signal_event(candle, "BUY"))
+    return signals
+
+
+def bollinger_band_series(
+    values: list[float],
+    period: int,
+    stddev: float,
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    middle: list[float | None] = [None] * len(values)
+    upper: list[float | None] = [None] * len(values)
+    lower: list[float | None] = [None] * len(values)
+    if len(values) < period:
+        return middle, upper, lower
+    for index in range(period - 1, len(values)):
+        window = values[index - period + 1:index + 1]
+        current_middle = mean(window)
+        current_stddev = pstdev(window)
+        middle[index] = current_middle
+        upper[index] = current_middle + stddev * current_stddev
+        lower[index] = current_middle - stddev * current_stddev
+    return middle, upper, lower
+
+
+def bollinger_bandwidth_pct_series(
+    middle: list[float | None],
+    upper: list[float | None],
+    lower: list[float | None],
+) -> list[float | None]:
+    values: list[float | None] = []
+    for current_middle, current_upper, current_lower in zip(middle, upper, lower):
+        if current_middle is None or current_upper is None or current_lower is None or current_middle == 0:
+            values.append(None)
+        else:
+            values.append((current_upper - current_lower) / current_middle * 100)
+    return values
+
+
+def has_low_bandwidth_percentile(
+    bandwidth: list[float | None],
+    index: int,
+    lookback: int,
+    percentile: float,
+) -> bool:
+    if index < lookback or bandwidth[index] is None:
+        return False
+    prior_values = [
+        value
+        for value in bandwidth[index - lookback:index]
+        if value is not None
+    ]
+    if len(prior_values) < lookback:
+        return False
+    return bandwidth[index] <= percentile_value(prior_values, percentile)
+
+
+def percentile_value(values: list[float], percentile: float) -> float:
+    if not values:
+        raise ValueError("values cannot be empty")
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = (percentile / 100) * (len(sorted_values) - 1)
+    lower_index = int(rank)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    fraction = rank - lower_index
+    return sorted_values[lower_index] + (sorted_values[upper_index] - sorted_values[lower_index]) * fraction
+
+
+def ema_slope_positive(ema: list[float | None], index: int, lookback: int) -> bool:
+    if index < lookback or ema[index] is None or ema[index - lookback] is None:
+        return False
+    return ema[index] > ema[index - lookback]
+
+
+def has_volume_ma_spike(
+    candles: list[Candle],
+    index: int,
+    lookback: int,
+    multiplier: float,
+) -> bool:
+    current_volume = candles[index].volume
+    if current_volume is None or current_volume <= 0 or index < lookback:
+        return False
+    prior_volumes = [
+        candle.volume
+        for candle in candles[index - lookback:index]
+        if candle.volume is not None and candle.volume > 0
+    ]
+    if len(prior_volumes) < lookback:
+        return False
+    return current_volume >= mean(prior_volumes) * multiplier
+
+
+def recent_return_pct(values: list[float], index: int, lookback: int) -> float:
+    if index < lookback:
+        return float("inf")
+    previous = values[index - lookback]
+    if previous == 0:
+        return float("inf")
+    return (values[index] - previous) / previous * 100
 
 
 def rsi_signals(candles: list[Candle], buy_threshold: float, sell_threshold: float) -> list[dict[str, Any]]:
