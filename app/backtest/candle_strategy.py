@@ -43,6 +43,8 @@ FIXED_UNIVERSE_MIN_SIZE = 1
 FIXED_UNIVERSE_MAX_SIZE = 3
 STRATEGIES = (
     "ema",
+    "ema_volume_spike_2x",
+    "ema_volume_spike_3x",
     "bollinger",
     "rsi",
     "ema_rsi",
@@ -117,6 +119,7 @@ class Candle:
     price: float
     high: float | None = None
     low: float | None = None
+    volume: float | None = None
 
     @property
     def high_price(self) -> float:
@@ -125,6 +128,13 @@ class Candle:
     @property
     def low_price(self) -> float:
         return self.price if self.low is None else self.low
+
+
+VOLUME_EMA_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
+VOLUME_EMA_DAYS = 365
+VOLUME_EMA_WALK_FORWARD_WINDOW_DAYS = 30
+VOLUME_SPIKE_LOOKBACK = 10
+VOLUME_SPIKE_MULTIPLIERS = (2.0, 3.0)
 
 
 @dataclass
@@ -188,6 +198,9 @@ def main() -> None:
             return
         if args.compare_macd_trend:
             print_macd_trend_comparison(conn)
+            return
+        if args.compare_volume_ema:
+            print_volume_ema_comparison(conn)
             return
         if args.compare_trend_strategies:
             print_trend_strategy_comparison(conn)
@@ -261,6 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-ichimoku", action="store_true")
     parser.add_argument("--compare-ichimoku-strict", action="store_true")
     parser.add_argument("--compare-macd-trend", action="store_true")
+    parser.add_argument("--compare-volume-ema", action="store_true")
     parser.add_argument("--compare-trend-strategies", action="store_true")
     parser.add_argument("--trade-attribution", action="store_true")
     parser.add_argument("--long-validation", action="store_true")
@@ -1788,6 +1802,78 @@ def sort_macd_trend_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=trend_strategy_sort_key)
 
 
+def print_volume_ema_comparison(conn: sqlite3.Connection) -> None:
+    rows = sort_volume_ema_rows(volume_ema_comparison_rows(conn))
+    table = Table(title="EMA Crossover + Volume Spike Comparison")
+    table.add_column("strategy", no_wrap=True)
+    table.add_column("trade_count", no_wrap=True, justify="right")
+    table.add_column("average_return_pct", no_wrap=True, justify="right")
+    table.add_column("median_return_pct", no_wrap=True, justify="right")
+    table.add_column("positive_window_count", no_wrap=True, justify="right")
+    table.add_column("negative_window_count", no_wrap=True, justify="right")
+    table.add_column("worst_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("best_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("max_drawdown_pct", no_wrap=True, justify="right")
+    table.add_column("average_hold_minutes", no_wrap=True, justify="right")
+    for row in rows:
+        table.add_row(
+            row["strategy"],
+            str(row["trade_count"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            format_optional_float(row["average_hold_minutes"]),
+        )
+    Console(width=220).print(table)
+
+
+def volume_ema_comparison_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = [
+        summarize_strategy_family(
+            "candidate_v1",
+            run_walk_forward_summaries(conn, volume_ema_candidate_v1_args(), list(VOLUME_EMA_MARKETS)),
+        ),
+        summarize_strategy_family(
+            "ema",
+            run_walk_forward_summaries(conn, volume_ema_args("ema"), list(VOLUME_EMA_MARKETS)),
+        ),
+    ]
+    for multiplier in VOLUME_SPIKE_MULTIPLIERS:
+        strategy = f"ema_volume_spike_{multiplier:g}x"
+        rows.append(summarize_strategy_family(
+            strategy,
+            run_walk_forward_summaries(conn, volume_ema_args(strategy), list(VOLUME_EMA_MARKETS)),
+        ))
+    return rows
+
+
+def volume_ema_candidate_v1_args() -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.days = VOLUME_EMA_DAYS
+    args.walk_forward_window_days = VOLUME_EMA_WALK_FORWARD_WINDOW_DAYS
+    return args
+
+
+def volume_ema_args(strategy: str) -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.strategy = strategy
+    args.days = VOLUME_EMA_DAYS
+    args.walk_forward_window_days = VOLUME_EMA_WALK_FORWARD_WINDOW_DAYS
+    args.take_profit_pct = 0.0
+    args.stop_loss_pct = 0.0
+    args.max_hold_hours = None
+    args.min_signal_gap_minutes = 0
+    return args
+
+
+def sort_volume_ema_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=trend_strategy_sort_key)
+
+
 def print_trend_strategy_comparison(conn: sqlite3.Connection) -> None:
     rows = sort_trend_strategy_rows(trend_strategy_comparison_rows(conn))
     table = Table(title="Multi-Timeframe Trend Strategy Comparison")
@@ -2639,15 +2725,17 @@ def load_candles(
             price=float(row["trade_price"]),
             high=float(row["high_price"] if row["high_price"] is not None else row["trade_price"]),
             low=float(row["low_price"] if row["low_price"] is not None else row["trade_price"]),
+            volume=float(row["candle_acc_trade_volume"]) if row["candle_acc_trade_volume"] is not None else None,
         ))
     return candles
 
 
 def candle_price_columns(conn: sqlite3.Connection) -> str:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(candles)").fetchall()}
+    volume_sql = "candle_acc_trade_volume" if "candle_acc_trade_volume" in columns else "NULL AS candle_acc_trade_volume"
     if {"high_price", "low_price"}.issubset(columns):
-        return "candle_date_time_utc, trade_price, high_price, low_price"
-    return "candle_date_time_utc, trade_price, trade_price AS high_price, trade_price AS low_price"
+        return f"candle_date_time_utc, trade_price, high_price, low_price, {volume_sql}"
+    return f"candle_date_time_utc, trade_price, trade_price AS high_price, trade_price AS low_price, {volume_sql}"
 
 
 def validate_strategy_interval(strategy: str, interval: str) -> None:
@@ -2667,6 +2755,10 @@ def strategy_signals(
 ) -> list[dict[str, Any]]:
     if strategy == "ema":
         return ema_signals(candles)
+    if strategy == "ema_volume_spike_2x":
+        return ema_volume_spike_signals(candles, volume_multiplier=2.0)
+    if strategy == "ema_volume_spike_3x":
+        return ema_volume_spike_signals(candles, volume_multiplier=3.0)
     if strategy == "bollinger":
         return bollinger_signals(candles, period=bollinger_period, stddev=bollinger_stddev)
     if strategy == "rsi":
@@ -2738,6 +2830,48 @@ def ema_signals(candles: list[Candle]) -> list[dict[str, Any]]:
         elif previous_fast >= previous_slow and current_fast < current_slow:
             signals.append(signal_event(candles[index], "SELL"))
     return signals
+
+
+def ema_volume_spike_signals(candles: list[Candle], volume_multiplier: float) -> list[dict[str, Any]]:
+    if not candles:
+        return []
+
+    prices = [candle.price for candle in candles]
+    ema_fast = ema_series(prices, EMA_FAST)
+    ema_slow = ema_series(prices, EMA_SLOW)
+    signals = []
+    for index in range(1, len(candles)):
+        previous_fast = ema_fast[index - 1]
+        previous_slow = ema_slow[index - 1]
+        current_fast = ema_fast[index]
+        current_slow = ema_slow[index]
+        if None in (previous_fast, previous_slow, current_fast, current_slow):
+            continue
+        if previous_fast <= previous_slow and current_fast > current_slow:
+            if has_volume_spike(candles, index, VOLUME_SPIKE_LOOKBACK, volume_multiplier):
+                signals.append(signal_event(candles[index], "BUY"))
+        elif previous_fast >= previous_slow and current_fast < current_slow:
+            signals.append(signal_event(candles[index], "SELL"))
+    return signals
+
+
+def has_volume_spike(
+    candles: list[Candle],
+    index: int,
+    lookback: int,
+    multiplier: float,
+) -> bool:
+    current_volume = candles[index].volume
+    if current_volume is None or current_volume <= 0 or index < lookback:
+        return False
+    prior_volumes = [
+        candle.volume
+        for candle in candles[index - lookback:index]
+        if candle.volume is not None and candle.volume > 0
+    ]
+    if len(prior_volumes) < lookback:
+        return False
+    return current_volume >= mean(prior_volumes) * multiplier
 
 
 def rsi_signals(candles: list[Candle], buy_threshold: float, sell_threshold: float) -> list[dict[str, Any]]:
@@ -2871,12 +3005,14 @@ def derive_timeframe_candles(candles: list[Candle], timeframe_minutes: int) -> l
     for bucket_ts in sorted(grouped):
         bucket = grouped[bucket_ts]
         last_candle = bucket[-1]
+        volumes = [candle.volume for candle in bucket if candle.volume is not None]
         derived.append(Candle(
             market=last_candle.market,
             ts=last_candle.ts,
             price=last_candle.price,
             high=max(candle.high_price for candle in bucket),
             low=min(candle.low_price for candle in bucket),
+            volume=sum(volumes) if volumes else None,
         ))
     return derived
 
