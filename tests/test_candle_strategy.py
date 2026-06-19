@@ -19,6 +19,9 @@ from app.backtest.candle_strategy import (
     apply_profile_defaults,
     aligned_mtf_trend,
     bollinger_rsi_parameter_grid,
+    bollinger_squeeze_volume_args,
+    bollinger_squeeze_volume_label,
+    bollinger_squeeze_volume_signals,
     build_bollinger_rsi_sweep_report,
     build_compare_all_strategies_report,
     attribution_rows,
@@ -31,6 +34,7 @@ from app.backtest.candle_strategy import (
     fixed_universe_args,
     fixed_universes,
     has_volume_spike,
+    has_low_bandwidth_percentile,
     ichimoku_args,
     ichimoku_candidate_v1_args,
     ichimoku_midpoint_series,
@@ -50,6 +54,7 @@ from app.backtest.candle_strategy import (
     main,
     merge_fixed_universe_window_input,
     parse_args,
+    percentile_value,
     hold_tp_baseline_args,
     hold_tp_sweep_args,
     prior_market_return,
@@ -65,6 +70,7 @@ from app.backtest.candle_strategy import (
     summarize_market_subset,
     run_dynamic_universe_summary,
     sort_trend_strategy_rows,
+    sort_bollinger_squeeze_volume_rows,
     sort_volume_ema_rows,
     summarize_strategy_family,
     summarize_walk_forward,
@@ -402,6 +408,102 @@ class VolumeEmaResearchTests(unittest.TestCase):
         sorted_rows = sort_volume_ema_rows(rows)
 
         self.assertEqual([row["strategy"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
+
+
+class BollingerSqueezeVolumeResearchTests(unittest.TestCase):
+    def test_percentile_value_interpolates(self) -> None:
+        self.assertEqual(percentile_value([1.0, 2.0, 3.0, 4.0, 5.0], 25), 2.0)
+        self.assertEqual(percentile_value([10.0], 25), 10.0)
+
+    def test_low_bandwidth_percentile_uses_prior_values(self) -> None:
+        bandwidth = [10.0] * 100 + [2.0]
+
+        self.assertTrue(has_low_bandwidth_percentile(bandwidth, 100, 100, 25))
+        self.assertFalse(has_low_bandwidth_percentile(bandwidth, 99, 100, 25))
+
+    def test_bollinger_squeeze_volume_signals_buy_on_breakout_with_volume(self) -> None:
+        candles = [ohlc_candle(index, 100.0, volume=10.0) for index in range(120)]
+        candles.append(ohlc_candle(120, 102.0, volume=25.0))
+        middle = [100.0] * 121
+        upper = [105.0] * 121
+        lower = [95.0] * 121
+        upper[120] = 101.0
+        lower[120] = 99.0
+        ema = [100.0] * 121
+        ema[117] = 99.0
+        ema[120] = 100.0
+
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.bollinger_band_series",
+            return_value=(middle, upper, lower),
+        ), unittest.mock.patch("app.backtest.candle_strategy.ema_series", return_value=ema):
+            signals = bollinger_squeeze_volume_signals(candles, volume_spike_multiplier=2.0, max_recent_pump_pct=3.0)
+
+        self.assertEqual([(signal["signal"], signal["ts"]) for signal in signals], [("BUY", ts(120))])
+
+    def test_bollinger_squeeze_volume_signals_reject_recent_pump(self) -> None:
+        candles = [ohlc_candle(index, 100.0, volume=10.0) for index in range(120)]
+        candles[114] = ohlc_candle(114, 95.0, volume=10.0)
+        candles.append(ohlc_candle(120, 102.0, volume=25.0))
+        middle = [100.0] * 121
+        upper = [105.0] * 121
+        lower = [95.0] * 121
+        upper[120] = 101.0
+        lower[120] = 99.0
+        ema = [100.0] * 121
+        ema[117] = 99.0
+        ema[120] = 100.0
+
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.bollinger_band_series",
+            return_value=(middle, upper, lower),
+        ), unittest.mock.patch("app.backtest.candle_strategy.ema_series", return_value=ema):
+            signals = bollinger_squeeze_volume_signals(candles, volume_spike_multiplier=2.0, max_recent_pump_pct=3.0)
+
+        self.assertNotIn("BUY", [signal["signal"] for signal in signals])
+
+    def test_bollinger_squeeze_volume_signals_sell_below_ema(self) -> None:
+        candles = [ohlc_candle(index, 100.0, volume=10.0) for index in range(120)]
+        candles.append(ohlc_candle(120, 99.0, volume=25.0))
+        middle = [100.0] * 121
+        upper = [105.0] * 121
+        lower = [95.0] * 121
+        ema = [100.0] * 121
+
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.bollinger_band_series",
+            return_value=(middle, upper, lower),
+        ), unittest.mock.patch("app.backtest.candle_strategy.ema_series", return_value=ema):
+            signals = bollinger_squeeze_volume_signals(candles, volume_spike_multiplier=2.0, max_recent_pump_pct=3.0)
+
+        self.assertEqual(signals[-1]["signal"], "SELL")
+
+    def test_bollinger_squeeze_volume_args_do_not_modify_candidate_v1(self) -> None:
+        args = bollinger_squeeze_volume_args(1.5, 1.2, 12)
+
+        self.assertEqual(args.strategy, "bollinger_squeeze_volume")
+        self.assertEqual(args.days, 365)
+        self.assertEqual(args.walk_forward_window_days, 30)
+        self.assertEqual(args.take_profit_pct, 1.5)
+        self.assertEqual(args.stop_loss_pct, 1.2)
+        self.assertEqual(args.max_hold_hours, 12)
+        self.assertEqual(args.min_signal_gap_minutes, 0)
+
+    def test_bollinger_squeeze_volume_label_includes_parameters(self) -> None:
+        label = bollinger_squeeze_volume_label(15, 2.5, 5.0, 1.5, 1.2, 12)
+
+        self.assertEqual(label, "squeeze_volume_15m_vol_2.5x_pump_5_tp_1.5_sl_1.2_hold_12h")
+
+    def test_bollinger_squeeze_volume_sort_order(self) -> None:
+        rows = [
+            {"label": "low", "average_return_pct": 0.1, "positive_window_count": 3, "max_drawdown_pct": 0.1},
+            {"label": "better_positive", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.5},
+            {"label": "lower_drawdown", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.2},
+        ]
+
+        sorted_rows = sort_bollinger_squeeze_volume_rows(rows)
+
+        self.assertEqual([row["label"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
 
 
 class MultiTimeframeTrendTests(unittest.TestCase):
