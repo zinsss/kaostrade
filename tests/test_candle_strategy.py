@@ -27,8 +27,10 @@ from app.backtest.candle_strategy import (
     candle_price_at_or_before,
     close_position,
     configured_markets_with_candles,
+    ema_volume_spike_signals,
     fixed_universe_args,
     fixed_universes,
+    has_volume_spike,
     ichimoku_args,
     ichimoku_candidate_v1_args,
     ichimoku_midpoint_series,
@@ -63,6 +65,7 @@ from app.backtest.candle_strategy import (
     summarize_market_subset,
     run_dynamic_universe_summary,
     sort_trend_strategy_rows,
+    sort_volume_ema_rows,
     summarize_strategy_family,
     summarize_walk_forward,
     trend_candidate_v1_args,
@@ -81,13 +84,20 @@ def candle(minutes: int, price: float | None = None) -> Candle:
     return Candle(market="KRW-BTC", ts=ts(minutes), price=float(price if price is not None else minutes + 1))
 
 
-def ohlc_candle(minutes: int, close: float, high: float | None = None, low: float | None = None) -> Candle:
+def ohlc_candle(
+    minutes: int,
+    close: float,
+    high: float | None = None,
+    low: float | None = None,
+    volume: float | None = None,
+) -> Candle:
     return Candle(
         market="KRW-BTC",
         ts=ts(minutes),
         price=close,
         high=close if high is None else high,
         low=close if low is None else low,
+        volume=volume,
     )
 
 
@@ -323,6 +333,73 @@ class MacdTrendResearchTests(unittest.TestCase):
         ]
 
         sorted_rows = sort_macd_trend_rows(rows)
+
+        self.assertEqual([row["strategy"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
+
+
+class VolumeEmaResearchTests(unittest.TestCase):
+    def test_has_volume_spike_uses_prior_ten_candles(self) -> None:
+        candles = [ohlc_candle(index, 100.0, volume=10.0) for index in range(10)]
+        candles.append(ohlc_candle(10, 101.0, volume=25.0))
+        candles.append(ohlc_candle(11, 102.0, volume=29.0))
+
+        self.assertTrue(has_volume_spike(candles, 10, 10, 2.0))
+        self.assertFalse(has_volume_spike(candles, 10, 10, 3.0))
+        self.assertFalse(has_volume_spike(candles, 9, 10, 2.0))
+        self.assertFalse(has_volume_spike(candles, 11, 10, 3.0))
+
+    def test_ema_volume_spike_signals_buy_only_when_crossover_has_volume_spike(self) -> None:
+        candles = [ohlc_candle(index, 100.0 + index, volume=10.0) for index in range(12)]
+        candles[10].volume = 25.0
+        fast = [None] * 12
+        slow = [None] * 12
+        fast[9] = 99.0
+        slow[9] = 100.0
+        fast[10] = 101.0
+        slow[10] = 100.0
+        fast[11] = 99.0
+        slow[11] = 100.0
+
+        with unittest.mock.patch("app.backtest.candle_strategy.ema_series", side_effect=(fast, slow)):
+            signals = ema_volume_spike_signals(candles, 2.0)
+
+        self.assertEqual([(signal["signal"], signal["ts"]) for signal in signals], [("BUY", ts(10)), ("SELL", ts(11))])
+
+    def test_ema_volume_spike_signals_reject_crossover_without_volume_spike(self) -> None:
+        candles = [ohlc_candle(index, 100.0 + index, volume=10.0) for index in range(11)]
+        candles[10].volume = 19.0
+        fast = [None] * 11
+        slow = [None] * 11
+        fast[9] = 99.0
+        slow[9] = 100.0
+        fast[10] = 101.0
+        slow[10] = 100.0
+
+        with unittest.mock.patch("app.backtest.candle_strategy.ema_series", side_effect=(fast, slow)):
+            signals = ema_volume_spike_signals(candles, 2.0)
+
+        self.assertEqual(signals, [])
+
+    def test_derive_timeframe_candles_sums_volume(self) -> None:
+        candles = [
+            ohlc_candle(0, 100.0, volume=1.0),
+            ohlc_candle(1, 101.0, volume=2.0),
+            ohlc_candle(15, 102.0, volume=3.0),
+        ]
+
+        derived = derive_timeframe_candles(candles, 15)
+
+        self.assertEqual(derived[0].volume, 3.0)
+        self.assertEqual(derived[1].volume, 3.0)
+
+    def test_volume_ema_sort_order(self) -> None:
+        rows = [
+            {"strategy": "low", "average_return_pct": 0.1, "positive_window_count": 3, "max_drawdown_pct": 0.1},
+            {"strategy": "better_positive", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.5},
+            {"strategy": "lower_drawdown", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.2},
+        ]
+
+        sorted_rows = sort_volume_ema_rows(rows)
 
         self.assertEqual([row["strategy"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
 
