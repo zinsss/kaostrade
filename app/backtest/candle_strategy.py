@@ -118,6 +118,22 @@ BOLLINGER_SQUEEZE_EMA_PERIOD = 20
 BOLLINGER_SQUEEZE_EMA_SLOPE_LOOKBACK = 3
 BOLLINGER_SQUEEZE_VOLUME_MA_PERIOD = 20
 BOLLINGER_SQUEEZE_RECENT_PUMP_LOOKBACK = 6
+EMA_VOLUME_EXPANSION_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
+EMA_VOLUME_EXPANSION_DAYS = 365
+EMA_VOLUME_EXPANSION_WALK_FORWARD_WINDOW_DAYS = 30
+EMA_VOLUME_EXPANSION_TIMEFRAMES = (5, 15)
+EMA_VOLUME_EXPANSION_MULTIPLIERS = (2.0, 2.5, 3.0)
+EMA_VOLUME_EXPANSION_BTC_FILTER_PCTS = (-0.5, -0.3, 0.0)
+EMA_VOLUME_EXPANSION_TAKE_PROFIT_PCTS = (1.0, 1.5, 2.0)
+EMA_VOLUME_EXPANSION_STOP_LOSS_PCTS = (0.8, 1.2)
+EMA_VOLUME_EXPANSION_MAX_HOLD_HOURS = (6, 12, 24)
+EMA_VOLUME_EXPANSION_FAST = 10
+EMA_VOLUME_EXPANSION_SLOW = 50
+EMA_VOLUME_EXPANSION_SLOPE_EMA = 20
+EMA_VOLUME_EXPANSION_SLOPE_LOOKBACK = 3
+EMA_VOLUME_EXPANSION_VOLUME_MA_PERIOD = 20
+EMA_VOLUME_EXPANSION_CLOSE_LOCATION_MIN = 0.70
+EMA_VOLUME_EXPANSION_BTC_LOOKBACK_HOURS = 1
 TREND_STRATEGY_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
 TREND_STRATEGY_DAYS = 365
 TREND_STRATEGY_WALK_FORWARD_WINDOW_DAYS = 30
@@ -134,9 +150,14 @@ class Candle:
     market: str
     ts: str
     price: float
+    open: float | None = None
     high: float | None = None
     low: float | None = None
     volume: float | None = None
+
+    @property
+    def open_price(self) -> float:
+        return self.price if self.open is None else self.open
 
     @property
     def high_price(self) -> float:
@@ -222,6 +243,9 @@ def main() -> None:
         if args.compare_bollinger_squeeze_volume:
             print_bollinger_squeeze_volume_comparison(conn)
             return
+        if args.compare_ema_volume_expansion:
+            print_ema_volume_expansion_comparison(conn)
+            return
         if args.compare_trend_strategies:
             print_trend_strategy_comparison(conn)
             return
@@ -296,6 +320,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-macd-trend", action="store_true")
     parser.add_argument("--compare-volume-ema", action="store_true")
     parser.add_argument("--compare-bollinger-squeeze-volume", action="store_true")
+    parser.add_argument("--compare-ema-volume-expansion", action="store_true")
     parser.add_argument("--compare-trend-strategies", action="store_true")
     parser.add_argument("--trade-attribution", action="store_true")
     parser.add_argument("--long-validation", action="store_true")
@@ -2159,6 +2184,272 @@ def sort_bollinger_squeeze_volume_rows(rows: list[dict[str, Any]]) -> list[dict[
     return sorted(rows, key=trend_strategy_sort_key)
 
 
+def print_ema_volume_expansion_comparison(conn: sqlite3.Connection) -> None:
+    baseline = ema_volume_expansion_candidate_v1_row(conn)
+    expansion_rows = sort_ema_volume_expansion_rows(ema_volume_expansion_rows(conn))
+    best_expansion = expansion_rows[0] if expansion_rows else None
+
+    baseline_table = Table(title="Candidate v1 Baseline")
+    add_ema_volume_expansion_columns(baseline_table)
+    add_ema_volume_expansion_row(baseline_table, baseline)
+
+    top_table = Table(title="Top 10 EMA Crossover + Bullish Volume Expansion Rows")
+    add_ema_volume_expansion_columns(top_table)
+    for row in expansion_rows[:10]:
+        add_ema_volume_expansion_row(top_table, row)
+
+    bottom_table = Table(title="Bottom 10 EMA Crossover + Bullish Volume Expansion Rows")
+    add_ema_volume_expansion_columns(bottom_table)
+    for row in expansion_rows[-10:]:
+        add_ema_volume_expansion_row(bottom_table, row)
+
+    console = Console(width=420)
+    console.print(baseline_table)
+    console.print(top_table)
+    console.print(bottom_table)
+    console.print(ema_volume_expansion_verdict(baseline, best_expansion))
+
+
+def add_ema_volume_expansion_columns(table: Table) -> None:
+    table.add_column("label", no_wrap=True)
+    table.add_column("timeframe", no_wrap=True, justify="right")
+    table.add_column("trade_count", no_wrap=True, justify="right")
+    table.add_column("average_return_pct", no_wrap=True, justify="right")
+    table.add_column("median_return_pct", no_wrap=True, justify="right")
+    table.add_column("positive_window_count", no_wrap=True, justify="right")
+    table.add_column("negative_window_count", no_wrap=True, justify="right")
+    table.add_column("worst_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("best_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("max_drawdown_pct", no_wrap=True, justify="right")
+    table.add_column("average_hold_minutes", no_wrap=True, justify="right")
+
+
+def add_ema_volume_expansion_row(table: Table, row: dict[str, Any]) -> None:
+    table.add_row(
+        row["label"],
+        row["timeframe"],
+        str(row["trade_count"]),
+        format_optional_float(row["average_return_pct"]),
+        format_optional_float(row["median_return_pct"]),
+        str(row["positive_window_count"]),
+        str(row["negative_window_count"]),
+        format_optional_float(row["worst_window_return_pct"]),
+        format_optional_float(row["best_window_return_pct"]),
+        format_optional_float(row["max_drawdown_pct"]),
+        format_optional_float(row["average_hold_minutes"]),
+    )
+
+
+def ema_volume_expansion_verdict(
+    baseline: dict[str, Any],
+    best_expansion: dict[str, Any] | None,
+) -> str:
+    if best_expansion is None:
+        return "No EMA-volume expansion rows were generated."
+    beats_baseline = trend_strategy_sort_key(best_expansion) < trend_strategy_sort_key(baseline)
+    if beats_baseline:
+        return f"Best EMA-volume row beats candidate_v1: {best_expansion['label']}"
+    return f"No EMA-volume row beats candidate_v1. Best EMA-volume row: {best_expansion['label']}"
+
+
+def ema_volume_expansion_candidate_v1_row(conn: sqlite3.Connection) -> dict[str, Any]:
+    return summarize_ema_volume_expansion_result(
+        label="candidate_v1",
+        timeframe="1m",
+        summaries=run_walk_forward_summaries(
+            conn,
+            ema_volume_expansion_candidate_v1_args(),
+            list(EMA_VOLUME_EXPANSION_MARKETS),
+        ),
+    )
+
+
+def ema_volume_expansion_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    windows = walk_forward_windows(
+        EMA_VOLUME_EXPANSION_DAYS,
+        EMA_VOLUME_EXPANSION_WALK_FORWARD_WINDOW_DAYS,
+    )
+    window_inputs_by_timeframe = {
+        timeframe: [
+            build_ema_volume_expansion_window_input(conn, timeframe, window_start, window_end)
+            for window_start, window_end in windows
+        ]
+        for timeframe in EMA_VOLUME_EXPANSION_TIMEFRAMES
+    }
+    rows = []
+    for timeframe in EMA_VOLUME_EXPANSION_TIMEFRAMES:
+        for volume_multiplier in EMA_VOLUME_EXPANSION_MULTIPLIERS:
+            for btc_filter_pct in EMA_VOLUME_EXPANSION_BTC_FILTER_PCTS:
+                signal_window_inputs = [
+                    build_ema_volume_expansion_signal_window_input(
+                        window_input,
+                        volume_multiplier=volume_multiplier,
+                        btc_filter_pct=btc_filter_pct,
+                    )
+                    for window_input in window_inputs_by_timeframe[timeframe]
+                ]
+                for take_profit_pct in EMA_VOLUME_EXPANSION_TAKE_PROFIT_PCTS:
+                    for stop_loss_pct in EMA_VOLUME_EXPANSION_STOP_LOSS_PCTS:
+                        for max_hold_hours in EMA_VOLUME_EXPANSION_MAX_HOLD_HOURS:
+                            summaries = [
+                                run_ema_volume_expansion_window_summary(
+                                    window_input,
+                                    take_profit_pct=take_profit_pct,
+                                    stop_loss_pct=stop_loss_pct,
+                                    max_hold_hours=max_hold_hours,
+                                )
+                                for window_input in signal_window_inputs
+                            ]
+                            rows.append(summarize_ema_volume_expansion_result(
+                                label=ema_volume_expansion_label(
+                                    timeframe,
+                                    volume_multiplier,
+                                    btc_filter_pct,
+                                    take_profit_pct,
+                                    stop_loss_pct,
+                                    max_hold_hours,
+                                ),
+                                timeframe=f"{timeframe}m",
+                                summaries=summaries,
+                            ))
+    return rows
+
+
+def build_ema_volume_expansion_window_input(
+    conn: sqlite3.Connection,
+    timeframe: int,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, Any]:
+    candles_by_market = {}
+    for market in EMA_VOLUME_EXPANSION_MARKETS:
+        one_minute_candles = load_candles(
+            conn,
+            market,
+            "1m",
+            EMA_VOLUME_EXPANSION_DAYS,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        candles_by_market[market] = derive_timeframe_candles(one_minute_candles, timeframe)
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "markets": list(EMA_VOLUME_EXPANSION_MARKETS),
+        "timeframe": timeframe,
+        "candles_by_market": candles_by_market,
+        "final_prices": {
+            market: candles[-1].price
+            for market, candles in candles_by_market.items()
+            if candles
+        },
+    }
+
+
+def build_ema_volume_expansion_signal_window_input(
+    window_input: dict[str, Any],
+    volume_multiplier: float,
+    btc_filter_pct: float,
+) -> dict[str, Any]:
+    btc_candles = window_input["candles_by_market"].get("KRW-BTC", [])
+    signals_by_market = {
+        market: ema_volume_expansion_signals(
+            candles,
+            btc_candles=btc_candles,
+            volume_spike_multiplier=volume_multiplier,
+            btc_filter_pct=btc_filter_pct,
+        )
+        for market, candles in window_input["candles_by_market"].items()
+    }
+    return {
+        "window_start": window_input["window_start"],
+        "window_end": window_input["window_end"],
+        "markets": window_input["markets"],
+        "events": build_price_events(window_input["candles_by_market"], signals_by_market),
+        "final_prices": window_input["final_prices"],
+        "raw_signal_count": sum(len(signals) for signals in signals_by_market.values()),
+        "accepted_signal_count": sum(len(signals) for signals in signals_by_market.values()),
+    }
+
+
+def run_ema_volume_expansion_window_summary(
+    signal_window_input: dict[str, Any],
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> dict[str, Any]:
+    summary_args = ema_volume_expansion_args(take_profit_pct, stop_loss_pct, max_hold_hours)
+    return run_hold_tp_window_summary(signal_window_input, summary_args)
+
+
+def ema_volume_expansion_candidate_v1_args() -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.days = EMA_VOLUME_EXPANSION_DAYS
+    args.walk_forward_window_days = EMA_VOLUME_EXPANSION_WALK_FORWARD_WINDOW_DAYS
+    return args
+
+
+def ema_volume_expansion_args(
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.strategy = "ema_volume_expansion"
+    args.days = EMA_VOLUME_EXPANSION_DAYS
+    args.walk_forward_window_days = EMA_VOLUME_EXPANSION_WALK_FORWARD_WINDOW_DAYS
+    args.take_profit_pct = take_profit_pct
+    args.stop_loss_pct = stop_loss_pct
+    args.max_hold_hours = max_hold_hours
+    args.min_signal_gap_minutes = 0
+    return args
+
+
+def summarize_ema_volume_expansion_result(
+    label: str,
+    timeframe: str,
+    summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    walk_forward_summary = summarize_walk_forward(summaries)
+    average_hold_values = [
+        float(summary["average_hold_minutes"])
+        for summary in summaries
+        if summary["average_hold_minutes"] is not None
+    ]
+    return {
+        "label": label,
+        "timeframe": timeframe,
+        "trade_count": walk_forward_summary["total_trade_count"],
+        "average_return_pct": walk_forward_summary["average_return_pct"],
+        "median_return_pct": walk_forward_summary["median_return_pct"],
+        "positive_window_count": walk_forward_summary["positive_window_count"],
+        "negative_window_count": walk_forward_summary["negative_window_count"],
+        "worst_window_return_pct": walk_forward_summary["worst_window_return_pct"],
+        "best_window_return_pct": walk_forward_summary["best_window_return_pct"],
+        "max_drawdown_pct": walk_forward_summary["worst_max_drawdown_pct"],
+        "average_hold_minutes": mean(average_hold_values) if average_hold_values else None,
+    }
+
+
+def ema_volume_expansion_label(
+    timeframe: int,
+    volume_multiplier: float,
+    btc_filter_pct: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> str:
+    return (
+        f"ema_volume_{timeframe}m_vol_{volume_multiplier:g}x"
+        f"_btc_{btc_filter_pct:g}_tp_{take_profit_pct:g}"
+        f"_sl_{stop_loss_pct:g}_hold_{max_hold_hours}h"
+    )
+
+
+def sort_ema_volume_expansion_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=trend_strategy_sort_key)
+
+
 def print_trend_strategy_comparison(conn: sqlite3.Connection) -> None:
     rows = sort_trend_strategy_rows(trend_strategy_comparison_rows(conn))
     table = Table(title="Multi-Timeframe Trend Strategy Comparison")
@@ -3008,6 +3299,7 @@ def load_candles(
             market=market,
             ts=ts,
             price=float(row["trade_price"]),
+            open=float(row["opening_price"] if row["opening_price"] is not None else row["trade_price"]),
             high=float(row["high_price"] if row["high_price"] is not None else row["trade_price"]),
             low=float(row["low_price"] if row["low_price"] is not None else row["trade_price"]),
             volume=float(row["candle_acc_trade_volume"]) if row["candle_acc_trade_volume"] is not None else None,
@@ -3017,10 +3309,11 @@ def load_candles(
 
 def candle_price_columns(conn: sqlite3.Connection) -> str:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(candles)").fetchall()}
+    open_sql = "opening_price" if "opening_price" in columns else "trade_price AS opening_price"
     volume_sql = "candle_acc_trade_volume" if "candle_acc_trade_volume" in columns else "NULL AS candle_acc_trade_volume"
     if {"high_price", "low_price"}.issubset(columns):
-        return f"candle_date_time_utc, trade_price, high_price, low_price, {volume_sql}"
-    return f"candle_date_time_utc, trade_price, trade_price AS high_price, trade_price AS low_price, {volume_sql}"
+        return f"candle_date_time_utc, trade_price, {open_sql}, high_price, low_price, {volume_sql}"
+    return f"candle_date_time_utc, trade_price, {open_sql}, trade_price AS high_price, trade_price AS low_price, {volume_sql}"
 
 
 def validate_strategy_interval(strategy: str, interval: str) -> None:
@@ -3303,6 +3596,102 @@ def recent_return_pct(values: list[float], index: int, lookback: int) -> float:
     return (values[index] - previous) / previous * 100
 
 
+def ema_volume_expansion_signals(
+    candles: list[Candle],
+    btc_candles: list[Candle],
+    volume_spike_multiplier: float,
+    btc_filter_pct: float,
+) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    ema_fast = ema_series(prices, EMA_VOLUME_EXPANSION_FAST)
+    ema_slow = ema_series(prices, EMA_VOLUME_EXPANSION_SLOW)
+    ema_slope = ema_series(prices, EMA_VOLUME_EXPANSION_SLOPE_EMA)
+    btc_filter = aligned_btc_return_filter(candles, btc_candles, btc_filter_pct)
+    signals = []
+    for index, candle in enumerate(candles):
+        if index == 0:
+            continue
+        previous_fast = ema_fast[index - 1]
+        previous_slow = ema_slow[index - 1]
+        current_fast = ema_fast[index]
+        current_slow = ema_slow[index]
+        if None in (previous_fast, previous_slow, current_fast, current_slow):
+            continue
+        if previous_fast >= previous_slow and current_fast < current_slow:
+            signals.append(signal_event(candle, "SELL"))
+            continue
+        if not (previous_fast <= previous_slow and current_fast > current_slow):
+            continue
+        if not ema_slope_positive(ema_slope, index, EMA_VOLUME_EXPANSION_SLOPE_LOOKBACK):
+            continue
+        if not has_bullish_volume_expansion(candles, index, volume_spike_multiplier):
+            continue
+        if not btc_filter.get(candle.ts, False):
+            continue
+        signals.append(signal_event(candle, "BUY"))
+    return signals
+
+
+def has_bullish_volume_expansion(
+    candles: list[Candle],
+    index: int,
+    volume_spike_multiplier: float,
+) -> bool:
+    candle = candles[index]
+    if candle.price <= candle.open_price:
+        return False
+    if not closes_near_high(candle, EMA_VOLUME_EXPANSION_CLOSE_LOCATION_MIN):
+        return False
+    return has_volume_ma_spike(
+        candles,
+        index,
+        EMA_VOLUME_EXPANSION_VOLUME_MA_PERIOD,
+        volume_spike_multiplier,
+    )
+
+
+def closes_near_high(candle: Candle, minimum_location: float) -> bool:
+    epsilon = 1e-12
+    range_size = max(candle.high_price - candle.low_price, epsilon)
+    close_location = (candle.price - candle.low_price) / range_size
+    return close_location >= minimum_location
+
+
+def aligned_btc_return_filter(
+    target_candles: list[Candle],
+    btc_candles: list[Candle],
+    min_return_pct: float,
+) -> dict[str, bool]:
+    if not target_candles or not btc_candles:
+        return {}
+    btc_points = [
+        (parse_utc_datetime(candle.ts), candle.price)
+        for candle in btc_candles
+    ]
+    btc_points.sort(key=lambda point: point[0])
+    filters: dict[str, bool] = {}
+    latest_index = -1
+    reference_index = -1
+    for candle in target_candles:
+        candle_ts = parse_utc_datetime(candle.ts)
+        reference_cutoff = candle_ts - timedelta(hours=EMA_VOLUME_EXPANSION_BTC_LOOKBACK_HOURS)
+        while latest_index + 1 < len(btc_points) and btc_points[latest_index + 1][0] <= candle_ts:
+            latest_index += 1
+        while reference_index + 1 < len(btc_points) and btc_points[reference_index + 1][0] <= reference_cutoff:
+            reference_index += 1
+        if latest_index < 0 or reference_index < 0:
+            filters[candle.ts] = False
+            continue
+        latest_price = btc_points[latest_index][1]
+        reference_price = btc_points[reference_index][1]
+        if reference_price <= 0:
+            filters[candle.ts] = False
+            continue
+        return_pct = (latest_price - reference_price) / reference_price * 100
+        filters[candle.ts] = return_pct >= min_return_pct
+    return filters
+
+
 def rsi_signals(candles: list[Candle], buy_threshold: float, sell_threshold: float) -> list[dict[str, Any]]:
     prices = [candle.price for candle in candles]
     rsi = rsi_series(prices, RSI_PERIOD)
@@ -3434,11 +3823,13 @@ def derive_timeframe_candles(candles: list[Candle], timeframe_minutes: int) -> l
     for bucket_ts in sorted(grouped):
         bucket = grouped[bucket_ts]
         last_candle = bucket[-1]
+        first_candle = bucket[0]
         volumes = [candle.volume for candle in bucket if candle.volume is not None]
         derived.append(Candle(
             market=last_candle.market,
             ts=last_candle.ts,
             price=last_candle.price,
+            open=first_candle.open_price,
             high=max(candle.high_price for candle in bucket),
             low=min(candle.low_price for candle in bucket),
             volume=sum(volumes) if volumes else None,
