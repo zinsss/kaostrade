@@ -49,6 +49,7 @@ STRATEGIES = (
     "donchian",
     "ichimoku",
     "ichimoku_strict_15m",
+    "macd_ema_filter_15m",
     "donchian_5m",
     "donchian_15m",
     "ema_trend_5m",
@@ -87,6 +88,17 @@ ICHIMOKU_STRICT_STOP_LOSS_PCTS = (0.8, 1.2, 1.5)
 ICHIMOKU_STRICT_MAX_HOLD_HOURS = (12, 24, 48)
 ICHIMOKU_STRICT_CLOUD_THICKNESS_PCT = 0.2
 ICHIMOKU_STRICT_MAX_DISTANCE_ABOVE_CLOUD_PCT = 2.0
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+MACD_TREND_EMA_FAST = 20
+MACD_TREND_EMA_SLOW = 100
+MACD_TREND_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
+MACD_TREND_DAYS = 365
+MACD_TREND_WALK_FORWARD_WINDOW_DAYS = 30
+MACD_TREND_TAKE_PROFIT_PCTS = (1.0, 2.0, 3.0)
+MACD_TREND_STOP_LOSS_PCTS = (0.8, 1.2, 1.5)
+MACD_TREND_MAX_HOLD_HOURS = (24, 48, 72)
 TREND_STRATEGY_MARKETS = ("KRW-BTC", "KRW-SOL", "KRW-DOGE")
 TREND_STRATEGY_DAYS = 365
 TREND_STRATEGY_WALK_FORWARD_WINDOW_DAYS = 30
@@ -174,6 +186,9 @@ def main() -> None:
         if args.compare_ichimoku_strict:
             print_ichimoku_strict_comparison(conn)
             return
+        if args.compare_macd_trend:
+            print_macd_trend_comparison(conn)
+            return
         if args.compare_trend_strategies:
             print_trend_strategy_comparison(conn)
             return
@@ -245,6 +260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-fixed-universes", action="store_true")
     parser.add_argument("--compare-ichimoku", action="store_true")
     parser.add_argument("--compare-ichimoku-strict", action="store_true")
+    parser.add_argument("--compare-macd-trend", action="store_true")
     parser.add_argument("--compare-trend-strategies", action="store_true")
     parser.add_argument("--trade-attribution", action="store_true")
     parser.add_argument("--long-validation", action="store_true")
@@ -1683,6 +1699,95 @@ def ichimoku_strict_sort_key(row: dict[str, Any]) -> tuple[float, int, float]:
     )
 
 
+def print_macd_trend_comparison(conn: sqlite3.Connection) -> None:
+    rows = sort_macd_trend_rows(macd_trend_comparison_rows(conn))
+    table = Table(title="MACD + Long Trend Filter Comparison")
+    table.add_column("strategy", no_wrap=True)
+    table.add_column("trade_count", no_wrap=True, justify="right")
+    table.add_column("average_return_pct", no_wrap=True, justify="right")
+    table.add_column("median_return_pct", no_wrap=True, justify="right")
+    table.add_column("positive_window_count", no_wrap=True, justify="right")
+    table.add_column("negative_window_count", no_wrap=True, justify="right")
+    table.add_column("worst_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("best_window_return_pct", no_wrap=True, justify="right")
+    table.add_column("max_drawdown_pct", no_wrap=True, justify="right")
+    table.add_column("average_hold_minutes", no_wrap=True, justify="right")
+    for row in rows:
+        table.add_row(
+            row["strategy"],
+            str(row["trade_count"]),
+            format_optional_float(row["average_return_pct"]),
+            format_optional_float(row["median_return_pct"]),
+            str(row["positive_window_count"]),
+            str(row["negative_window_count"]),
+            format_optional_float(row["worst_window_return_pct"]),
+            format_optional_float(row["best_window_return_pct"]),
+            format_optional_float(row["max_drawdown_pct"]),
+            format_optional_float(row["average_hold_minutes"]),
+        )
+    Console(width=260).print(table)
+
+
+def macd_trend_comparison_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = [
+        summarize_strategy_family(
+            "candidate_v1",
+            run_walk_forward_summaries(conn, macd_trend_candidate_v1_args(), list(MACD_TREND_MARKETS)),
+        )
+    ]
+    window_inputs = macd_trend_window_inputs(conn)
+    for take_profit_pct in MACD_TREND_TAKE_PROFIT_PCTS:
+        for stop_loss_pct in MACD_TREND_STOP_LOSS_PCTS:
+            for max_hold_hours in MACD_TREND_MAX_HOLD_HOURS:
+                args = macd_trend_args(take_profit_pct, stop_loss_pct, max_hold_hours)
+                summaries = [run_hold_tp_window_summary(window_input, args) for window_input in window_inputs]
+                rows.append(summarize_strategy_family(
+                    macd_trend_label(take_profit_pct, stop_loss_pct, max_hold_hours),
+                    summaries,
+                ))
+    return rows
+
+
+def macd_trend_window_inputs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    args = macd_trend_args(1.0, 0.8, 24)
+    windows = walk_forward_windows(args.days, args.walk_forward_window_days)
+    return [
+        build_hold_tp_window_input(conn, args, list(MACD_TREND_MARKETS), window_start, window_end)
+        for window_start, window_end in windows
+    ]
+
+
+def macd_trend_label(take_profit_pct: float, stop_loss_pct: float, max_hold_hours: int) -> str:
+    return f"macd_ema_filter_15m_tp_{take_profit_pct:g}_sl_{stop_loss_pct:g}_hold_{max_hold_hours}h"
+
+
+def macd_trend_candidate_v1_args() -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.days = MACD_TREND_DAYS
+    args.walk_forward_window_days = MACD_TREND_WALK_FORWARD_WINDOW_DAYS
+    return args
+
+
+def macd_trend_args(
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    max_hold_hours: int,
+) -> argparse.Namespace:
+    args = hold_tp_baseline_args()
+    args.strategy = "macd_ema_filter_15m"
+    args.days = MACD_TREND_DAYS
+    args.walk_forward_window_days = MACD_TREND_WALK_FORWARD_WINDOW_DAYS
+    args.take_profit_pct = take_profit_pct
+    args.stop_loss_pct = stop_loss_pct
+    args.max_hold_hours = max_hold_hours
+    args.min_signal_gap_minutes = 0
+    return args
+
+
+def sort_macd_trend_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rows, key=trend_strategy_sort_key)
+
+
 def print_trend_strategy_comparison(conn: sqlite3.Connection) -> None:
     rows = sort_trend_strategy_rows(trend_strategy_comparison_rows(conn))
     table = Table(title="Multi-Timeframe Trend Strategy Comparison")
@@ -2548,6 +2653,8 @@ def candle_price_columns(conn: sqlite3.Connection) -> str:
 def validate_strategy_interval(strategy: str, interval: str) -> None:
     if strategy == "bollinger_rsi_and_mtf" and interval != "1m":
         raise ValueError("bollinger_rsi_and_mtf requires --interval 1m")
+    if strategy == "macd_ema_filter_15m" and interval != "1m":
+        raise ValueError("macd_ema_filter_15m requires --interval 1m")
 
 
 def strategy_signals(
@@ -2580,6 +2687,8 @@ def strategy_signals(
         return ichimoku_signals(candles)
     if strategy == "ichimoku_strict_15m":
         return ichimoku_strict_signals(derive_timeframe_candles(candles, 15))
+    if strategy == "macd_ema_filter_15m":
+        return macd_ema_filter_signals(derive_timeframe_candles(candles, 15))
     if strategy == "bollinger_rsi_and":
         return bollinger_rsi_signals(
             candles,
@@ -2910,6 +3019,47 @@ def ichimoku_strict_signals(candles: list[Candle]) -> list[dict[str, Any]]:
     return signals
 
 
+def macd_ema_filter_signals(candles: list[Candle]) -> list[dict[str, Any]]:
+    prices = [candle.price for candle in candles]
+    ema_fast = ema_series(prices, MACD_TREND_EMA_FAST)
+    ema_slow = ema_series(prices, MACD_TREND_EMA_SLOW)
+    macd, signal = macd_signal_series(prices)
+    signals = []
+    in_position = False
+    for index, candle in enumerate(candles):
+        current_fast = ema_fast[index]
+        current_slow = ema_slow[index]
+        current_macd = macd[index]
+        current_signal = signal[index]
+        if None in (current_fast, current_slow, current_macd, current_signal):
+            continue
+        previous_macd = macd[index - 1] if index > 0 else None
+        previous_signal = signal[index - 1] if index > 0 else None
+        if previous_macd is None or previous_signal is None:
+            continue
+
+        trend_filter = current_fast > current_slow
+        macd_cross_above = previous_macd <= previous_signal and current_macd > current_signal
+        macd_cross_below = previous_macd >= previous_signal and current_macd < current_signal
+        if not in_position and trend_filter and macd_cross_above and current_macd > 0:
+            signals.append(signal_event(candle, "BUY"))
+            in_position = True
+        elif in_position and macd_cross_below:
+            signals.append(signal_event(candle, "SELL"))
+            in_position = False
+    return signals
+
+
+def macd_signal_series(values: list[float]) -> tuple[list[float | None], list[float | None]]:
+    ema_fast = ema_series(values, MACD_FAST)
+    ema_slow = ema_series(values, MACD_SLOW)
+    macd = [
+        fast - slow if fast is not None and slow is not None else None
+        for fast, slow in zip(ema_fast, ema_slow)
+    ]
+    return macd, optional_ema_series(macd, MACD_SIGNAL)
+
+
 def ichimoku_midpoint_series(candles: list[Candle], period: int) -> list[float | None]:
     series: list[float | None] = [None] * len(candles)
     if len(candles) < period:
@@ -2965,6 +3115,25 @@ def ema_series(values: list[float], period: int) -> list[float | None]:
     series[period - 1] = current
     for index in range(period, len(values)):
         current = (values[index] - current) * multiplier + current
+        series[index] = current
+    return series
+
+
+def optional_ema_series(values: list[float | None], period: int) -> list[float | None]:
+    series: list[float | None] = [None] * len(values)
+    multiplier = 2 / (period + 1)
+    current: float | None = None
+    seed_values: list[float] = []
+    for index, value in enumerate(values):
+        if value is None:
+            continue
+        if current is None:
+            seed_values.append(value)
+            if len(seed_values) == period:
+                current = mean(seed_values)
+                series[index] = current
+            continue
+        current = (value - current) * multiplier + current
         series[index] = current
     return series
 

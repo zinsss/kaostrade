@@ -35,7 +35,10 @@ from app.backtest.candle_strategy import (
     ichimoku_signals,
     ichimoku_strict_args,
     ichimoku_strict_signals,
+    macd_ema_filter_signals,
+    macd_trend_args,
     sort_ichimoku_strict_rows,
+    sort_macd_trend_rows,
     classify_single_backtest_verdict,
     classify_walk_forward_verdict,
     derive_five_minute_candles,
@@ -251,6 +254,75 @@ class TrendStrategyResearchTests(unittest.TestCase):
         ]
 
         sorted_rows = sort_trend_strategy_rows(rows)
+
+        self.assertEqual([row["strategy"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
+
+
+class MacdTrendResearchTests(unittest.TestCase):
+    def test_macd_trend_args_use_requested_sweep_settings(self) -> None:
+        args = macd_trend_args(2.0, 1.2, 48)
+
+        self.assertEqual(args.strategy, "macd_ema_filter_15m")
+        self.assertEqual(args.days, 365)
+        self.assertEqual(args.walk_forward_window_days, 30)
+        self.assertEqual(args.take_profit_pct, 2.0)
+        self.assertEqual(args.stop_loss_pct, 1.2)
+        self.assertEqual(args.max_hold_hours, 48)
+        self.assertEqual(args.min_signal_gap_minutes, 0)
+
+    def test_macd_ema_filter_signals_buy_on_positive_macd_cross_in_trend(self) -> None:
+        candles = [candle(0, 100.0), candle(1, 101.0), candle(2, 102.0)]
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.ema_series",
+            side_effect=([None, 101.0, 102.0], [None, 100.0, 100.0]),
+        ), unittest.mock.patch(
+            "app.backtest.candle_strategy.macd_signal_series",
+            return_value=([None, -0.1, 0.2], [None, 0.0, 0.1]),
+        ):
+            signals = macd_ema_filter_signals(candles)
+
+        self.assertEqual([signal["signal"] for signal in signals], ["BUY"])
+
+    def test_macd_ema_filter_signals_reject_cross_without_trend_filter(self) -> None:
+        candles = [candle(0, 100.0), candle(1, 101.0), candle(2, 102.0)]
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.ema_series",
+            side_effect=([None, 99.0, 99.0], [None, 100.0, 100.0]),
+        ), unittest.mock.patch(
+            "app.backtest.candle_strategy.macd_signal_series",
+            return_value=([None, -0.1, 0.2], [None, 0.0, 0.1]),
+        ):
+            signals = macd_ema_filter_signals(candles)
+
+        self.assertEqual(signals, [])
+
+    def test_macd_ema_filter_signals_sell_on_macd_cross_down(self) -> None:
+        candles = [candle(0, 100.0), candle(1, 101.0), candle(2, 102.0), candle(3, 101.0)]
+        with unittest.mock.patch(
+            "app.backtest.candle_strategy.ema_series",
+            side_effect=([None, 101.0, 102.0, 101.0], [None, 100.0, 100.0, 100.0]),
+        ), unittest.mock.patch(
+            "app.backtest.candle_strategy.macd_signal_series",
+            return_value=([None, -0.1, 0.2, 0.0], [None, 0.0, 0.1, 0.1]),
+        ):
+            signals = macd_ema_filter_signals(candles)
+
+        self.assertEqual([signal["signal"] for signal in signals], ["BUY", "SELL"])
+
+    def test_macd_trend_strategy_rejects_non_one_minute_interval(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires --interval 1m"):
+            validate_strategy_interval("macd_ema_filter_15m", "15m")
+
+        validate_strategy_interval("macd_ema_filter_15m", "1m")
+
+    def test_macd_trend_sort_order(self) -> None:
+        rows = [
+            {"strategy": "low", "average_return_pct": 0.1, "positive_window_count": 3, "max_drawdown_pct": 0.1},
+            {"strategy": "better_positive", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.5},
+            {"strategy": "lower_drawdown", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.2},
+        ]
+
+        sorted_rows = sort_macd_trend_rows(rows)
 
         self.assertEqual([row["strategy"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
 
