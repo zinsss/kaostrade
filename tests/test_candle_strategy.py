@@ -30,11 +30,16 @@ from app.backtest.candle_strategy import (
     candle_price_at_or_before,
     close_position,
     configured_markets_with_candles,
+    aligned_btc_return_filter,
     ema_volume_spike_signals,
+    ema_volume_expansion_args,
+    ema_volume_expansion_label,
+    ema_volume_expansion_signals,
     fixed_universe_args,
     fixed_universes,
     has_volume_spike,
     has_low_bandwidth_percentile,
+    has_bullish_volume_expansion,
     ichimoku_args,
     ichimoku_candidate_v1_args,
     ichimoku_midpoint_series,
@@ -71,6 +76,7 @@ from app.backtest.candle_strategy import (
     run_dynamic_universe_summary,
     sort_trend_strategy_rows,
     sort_bollinger_squeeze_volume_rows,
+    sort_ema_volume_expansion_rows,
     sort_volume_ema_rows,
     summarize_strategy_family,
     summarize_walk_forward,
@@ -93,6 +99,7 @@ def candle(minutes: int, price: float | None = None) -> Candle:
 def ohlc_candle(
     minutes: int,
     close: float,
+    open_price: float | None = None,
     high: float | None = None,
     low: float | None = None,
     volume: float | None = None,
@@ -101,6 +108,7 @@ def ohlc_candle(
         market="KRW-BTC",
         ts=ts(minutes),
         price=close,
+        open=close if open_price is None else open_price,
         high=close if high is None else high,
         low=close if low is None else low,
         volume=volume,
@@ -502,6 +510,93 @@ class BollingerSqueezeVolumeResearchTests(unittest.TestCase):
         ]
 
         sorted_rows = sort_bollinger_squeeze_volume_rows(rows)
+
+        self.assertEqual([row["label"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
+
+
+class EmaVolumeExpansionResearchTests(unittest.TestCase):
+    def test_bullish_volume_expansion_requires_green_close_near_high_and_volume(self) -> None:
+        candles = [ohlc_candle(index, 100.0, open_price=99.0, high=101.0, low=99.0, volume=10.0) for index in range(20)]
+        candles.append(ohlc_candle(20, 108.0, open_price=101.0, high=110.0, low=100.0, volume=25.0))
+        candles.append(ohlc_candle(21, 102.0, open_price=103.0, high=110.0, low=100.0, volume=25.0))
+        candles.append(ohlc_candle(22, 105.0, open_price=101.0, high=110.0, low=100.0, volume=25.0))
+
+        self.assertTrue(has_bullish_volume_expansion(candles, 20, 2.0))
+        self.assertFalse(has_bullish_volume_expansion(candles, 21, 2.0))
+        self.assertFalse(has_bullish_volume_expansion(candles, 22, 2.0))
+
+    def test_aligned_btc_return_filter_uses_one_hour_reference(self) -> None:
+        target_candles = [ohlc_candle(30, 100.0), ohlc_candle(60, 100.0), ohlc_candle(61, 100.0)]
+        btc_candles = [ohlc_candle(0, 100.0), ohlc_candle(60, 101.0), ohlc_candle(61, 99.0)]
+
+        filters = aligned_btc_return_filter(target_candles, btc_candles, min_return_pct=0.0)
+
+        self.assertFalse(filters[ts(30)])
+        self.assertTrue(filters[ts(60)])
+        self.assertFalse(filters[ts(61)])
+
+    def test_ema_volume_expansion_signals_buy_on_cross_with_volume_and_btc_filter(self) -> None:
+        candles = [ohlc_candle(index, 100.0, open_price=99.0, high=101.0, low=99.0, volume=10.0) for index in range(61)]
+        candles[60] = ohlc_candle(60, 108.0, open_price=101.0, high=110.0, low=100.0, volume=25.0)
+        btc_candles = [ohlc_candle(0, 100.0), ohlc_candle(60, 101.0)]
+        fast = [None] * 61
+        slow = [None] * 61
+        slope = [None] * 61
+        fast[59] = 99.0
+        slow[59] = 100.0
+        fast[60] = 101.0
+        slow[60] = 100.0
+        slope[57] = 99.0
+        slope[60] = 100.0
+
+        with unittest.mock.patch("app.backtest.candle_strategy.ema_series", side_effect=(fast, slow, slope)):
+            signals = ema_volume_expansion_signals(candles, btc_candles, 2.0, 0.0)
+
+        self.assertEqual([(signal["signal"], signal["ts"]) for signal in signals], [("BUY", ts(60))])
+
+    def test_ema_volume_expansion_signals_reject_failed_btc_filter(self) -> None:
+        candles = [ohlc_candle(index, 100.0, open_price=99.0, high=101.0, low=99.0, volume=10.0) for index in range(61)]
+        candles[60] = ohlc_candle(60, 108.0, open_price=101.0, high=110.0, low=100.0, volume=25.0)
+        btc_candles = [ohlc_candle(0, 100.0), ohlc_candle(60, 99.0)]
+        fast = [None] * 61
+        slow = [None] * 61
+        slope = [None] * 61
+        fast[59] = 99.0
+        slow[59] = 100.0
+        fast[60] = 101.0
+        slow[60] = 100.0
+        slope[57] = 99.0
+        slope[60] = 100.0
+
+        with unittest.mock.patch("app.backtest.candle_strategy.ema_series", side_effect=(fast, slow, slope)):
+            signals = ema_volume_expansion_signals(candles, btc_candles, 2.0, 0.0)
+
+        self.assertEqual(signals, [])
+
+    def test_ema_volume_expansion_args_do_not_modify_candidate_v1(self) -> None:
+        args = ema_volume_expansion_args(1.5, 1.2, 12)
+
+        self.assertEqual(args.strategy, "ema_volume_expansion")
+        self.assertEqual(args.days, 365)
+        self.assertEqual(args.walk_forward_window_days, 30)
+        self.assertEqual(args.take_profit_pct, 1.5)
+        self.assertEqual(args.stop_loss_pct, 1.2)
+        self.assertEqual(args.max_hold_hours, 12)
+        self.assertEqual(args.min_signal_gap_minutes, 0)
+
+    def test_ema_volume_expansion_label_includes_parameters(self) -> None:
+        label = ema_volume_expansion_label(15, 2.5, -0.3, 1.5, 1.2, 12)
+
+        self.assertEqual(label, "ema_volume_15m_vol_2.5x_btc_-0.3_tp_1.5_sl_1.2_hold_12h")
+
+    def test_ema_volume_expansion_sort_order(self) -> None:
+        rows = [
+            {"label": "low", "average_return_pct": 0.1, "positive_window_count": 3, "max_drawdown_pct": 0.1},
+            {"label": "better_positive", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.5},
+            {"label": "lower_drawdown", "average_return_pct": 0.2, "positive_window_count": 4, "max_drawdown_pct": 0.2},
+        ]
+
+        sorted_rows = sort_ema_volume_expansion_rows(rows)
 
         self.assertEqual([row["label"] for row in sorted_rows], ["lower_drawdown", "better_positive", "low"])
 
